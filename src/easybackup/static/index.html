@@ -1,0 +1,757 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0f19">
+  <meta name="description" content="EasyBackup 本地备份控制中心">
+  <title>EasyBackup · 备份控制中心</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23111827'/%3E%3Cpath d='M16 18h32v9H16zm0 12h32v9H16zm0 12h32v9H16z' fill='%233b82f6'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/app.css?v=20260731-ui3">
+</head>
+<body>
+  <a class="skip-link" href="#mainContent">跳到主要内容</a>
+
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar" aria-label="主导航">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span>
+          <strong>EasyBackup</strong>
+          <small>备份控制中心</small>
+        </span>
+      </div>
+
+      <nav class="main-nav">
+        <button class="nav-item is-active" type="button" data-view="dashboard">
+          <span class="nav-symbol" aria-hidden="true">⌂</span>
+          <span>概览</span>
+        </button>
+        <button class="nav-item" type="button" data-view="tasks">
+          <span class="nav-symbol" aria-hidden="true">▣</span>
+          <span>备份任务</span>
+          <span class="nav-count" id="navTaskCount">0</span>
+        </button>
+        <button class="nav-item" type="button" data-view="operations">
+          <span class="nav-symbol" aria-hidden="true">↻</span>
+          <span>调度与日志</span>
+          <span class="nav-pulse is-hidden" id="navOperationPulse" aria-label="有任务正在运行"></span>
+        </button>
+        <button class="nav-item" type="button" data-view="snapshots">
+          <span class="nav-symbol" aria-hidden="true">◇</span>
+          <span>快照与差分还原</span>
+        </button>
+        <button class="nav-item" type="button" data-view="credentials">
+          <span class="nav-symbol" aria-hidden="true">⌘</span>
+          <span>存储与密钥</span>
+        </button>
+        <button class="nav-item" type="button" data-view="system">
+          <span class="nav-symbol" aria-hidden="true">◌</span>
+          <span>系统诊断</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-foot">
+        <section class="sidebar-storage-card" aria-labelledby="sidebarStorageTitle">
+          <div class="sidebar-storage-head">
+            <span id="sidebarStorageTitle">保护概览</span>
+            <span class="sidebar-daemon" id="sidebarDaemonState">检测中</span>
+          </div>
+          <div class="sidebar-storage-main">
+            <div class="storage-ring" aria-hidden="true">
+              <span><strong id="sidebarProtectedTasks">0</strong><small>任务</small></span>
+            </div>
+            <dl>
+              <div><dt>存储目标</dt><dd id="sidebarStorageKinds">—</dd></div>
+              <div><dt>可用快照</dt><dd id="sidebarSnapshotCount">0</dd></div>
+              <div><dt>密钥托管</dt><dd id="sidebarCredentialState">检测中</dd></div>
+            </dl>
+          </div>
+          <div class="sidebar-next-run">
+            <span>下一次备份</span>
+            <strong id="sidebarNextRun">仅手动运行</strong>
+          </div>
+        </section>
+        <div class="connection-card">
+          <span class="connection-dot" id="connectionDot"></span>
+          <span>
+            <strong id="connectionLabel">正在连接</strong>
+            <small id="connectionHint">等待实时通道</small>
+          </span>
+        </div>
+        <p>本地优先 · 密钥安全托管</p>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <button class="icon-button menu-button" id="menuButton" type="button" aria-label="打开导航" aria-controls="sidebar" aria-expanded="false">☰</button>
+        <div class="page-heading">
+          <div class="breadcrumb"><span>EasyBackup</span><b>/</b><span class="eyebrow" id="pageEyebrow">CONTROL ROOM</span></div>
+          <h1 id="pageTitle">备份概览</h1>
+          <p id="pageSubtitle">所有任务、运行状态与系统健康一目了然。</p>
+        </div>
+        <div class="topbar-actions">
+          <button class="button button-ghost refresh-button" id="refreshButton" type="button">
+            <span aria-hidden="true">↻</span>
+            <span class="button-label">刷新</span>
+          </button>
+          <button class="button button-primary" id="globalNewTaskButton" type="button">
+            <span aria-hidden="true">＋</span>
+            新建任务
+          </button>
+        </div>
+      </header>
+
+      <main id="mainContent" tabindex="-1">
+        <section class="view is-active" id="view-dashboard" data-view-panel="dashboard">
+          <div class="hero-panel">
+            <div>
+              <span class="hero-kicker">LOCAL-FIRST BACKUP</span>
+              <h2>今天的数据，<br><em>已经安心了吗？</em></h2>
+              <p id="heroMessage">正在检查最近的备份状态…</p>
+            </div>
+            <div class="hero-actions">
+              <button class="button button-light" type="button" data-action="new-task">创建备份任务</button>
+              <button class="text-button light" type="button" data-navigate="operations">查看运行记录 <span aria-hidden="true">→</span></button>
+            </div>
+            <div class="hero-orbit" aria-hidden="true">
+              <span class="orbit-core"></span>
+              <span class="orbit-ring one"></span>
+              <span class="orbit-ring two"></span>
+              <span class="orbit-dot"></span>
+            </div>
+          </div>
+
+          <div class="metrics-grid" aria-label="备份指标">
+            <article class="metric-card">
+              <div class="metric-icon teal" aria-hidden="true">▣</div>
+              <div>
+                <span>备份任务</span>
+                <strong id="metricTasks">—</strong>
+                <small id="metricTasksHint">正在读取</small>
+              </div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-icon amber" aria-hidden="true">↻</div>
+              <div>
+                <span>正在运行</span>
+                <strong id="metricRunning">—</strong>
+                <small id="metricRunningHint">实时同步</small>
+              </div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-icon blue" aria-hidden="true">✓</div>
+              <div>
+                <span>最近成功</span>
+                <strong id="metricSuccess">—</strong>
+                <small id="metricSuccessHint">暂无记录</small>
+              </div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-icon rose" aria-hidden="true">◌</div>
+              <div>
+                <span>系统健康</span>
+                <strong class="metric-word" id="metricHealth">检查中</strong>
+                <small id="metricHealthHint">正在探测组件</small>
+              </div>
+            </article>
+          </div>
+
+          <div class="dashboard-grid">
+            <section class="panel active-panel">
+              <div class="section-heading">
+                <div>
+                  <span class="section-kicker">LIVE</span>
+                  <h2>正在进行</h2>
+                </div>
+                <button class="text-button" type="button" data-navigate="operations">全部记录 <span aria-hidden="true">→</span></button>
+              </div>
+              <div id="dashboardOperations" class="stack-list" aria-live="polite"></div>
+            </section>
+
+            <section class="panel tool-panel">
+              <div class="section-heading">
+                <div>
+                  <span class="section-kicker">READINESS</span>
+                  <h2>核心组件</h2>
+                </div>
+                <button class="icon-button" type="button" data-action="refresh-system" aria-label="重新检测系统组件">↻</button>
+              </div>
+              <div id="dashboardTools" class="tool-list"></div>
+            </section>
+          </div>
+
+          <section class="panel dashboard-tasks-panel">
+            <div class="section-heading">
+              <div>
+                <span class="section-kicker">SCHEDULE</span>
+                <h2>任务计划</h2>
+              </div>
+              <button class="text-button" type="button" data-navigate="tasks">管理任务 <span aria-hidden="true">→</span></button>
+            </div>
+            <div id="dashboardTasks" class="compact-task-grid"></div>
+          </section>
+        </section>
+
+        <section class="view" id="view-tasks" data-view-panel="tasks">
+          <div class="content-toolbar">
+            <label class="search-control">
+              <span aria-hidden="true">⌕</span>
+              <input id="taskSearch" type="search" placeholder="搜索任务、源目录或目标…" autocomplete="off">
+            </label>
+            <label class="select-control compact">
+              <span class="sr-only">按状态筛选</span>
+              <select id="taskStatusFilter">
+                <option value="all">全部状态</option>
+                <option value="enabled">已启用</option>
+                <option value="disabled">已停用</option>
+              </select>
+            </label>
+            <button class="button button-primary" type="button" data-action="new-task">＋ 新建任务</button>
+          </div>
+          <div class="task-grid" id="taskList"></div>
+        </section>
+
+        <section class="view" id="view-operations" data-view-panel="operations">
+          <div class="content-toolbar">
+            <div class="segmented-control" id="operationFilters" aria-label="运行状态筛选">
+              <button class="is-active" type="button" data-operation-filter="all">全部</button>
+              <button type="button" data-operation-filter="active">进行中</button>
+              <button type="button" data-operation-filter="completed">已完成</button>
+              <button type="button" data-operation-filter="failed">失败</button>
+            </div>
+            <button class="button button-secondary" type="button" data-action="refresh-operations">刷新记录</button>
+          </div>
+          <div id="operationList" class="operation-list"></div>
+        </section>
+
+        <section class="view" id="view-snapshots" data-view-panel="snapshots">
+          <div class="snapshot-layout">
+            <section class="panel snapshot-browser">
+              <div class="section-heading snapshot-heading">
+                <div>
+                  <span class="section-kicker">ARCHIVE</span>
+                  <h2>可用快照</h2>
+                </div>
+                <button class="icon-button" type="button" data-action="refresh-snapshots" aria-label="刷新快照">↻</button>
+              </div>
+              <label class="field">
+                <span>选择备份任务</span>
+                <select id="snapshotTaskFilter">
+                  <option value="">请选择任务</option>
+                </select>
+              </label>
+              <div id="snapshotList" class="snapshot-list"></div>
+            </section>
+
+            <section class="panel manifest-panel">
+              <div id="manifestPlaceholder" class="large-empty-state">
+                <span class="empty-glyph" aria-hidden="true">◇</span>
+                <h2>选择一个快照</h2>
+                <p>查看文件清单、筛选目标内容并发起安全还原。</p>
+              </div>
+              <div id="manifestContent" class="is-hidden">
+                <div class="manifest-header">
+                  <div>
+                    <span class="section-kicker">MANIFEST</span>
+                    <h2 id="manifestTitle">快照文件</h2>
+                    <p id="manifestMeta"></p>
+                  </div>
+                  <div class="inline-actions">
+                    <button class="button button-secondary" id="scrubSnapshotButton" type="button">完整性巡检</button>
+                    <button class="button button-primary" id="restoreSnapshotButton" type="button">还原所选</button>
+                  </div>
+                </div>
+                <div class="manifest-toolbar">
+                  <label class="search-control">
+                    <span aria-hidden="true">⌕</span>
+                    <input id="manifestSearch" type="search" placeholder="按路径筛选文件…" autocomplete="off">
+                  </label>
+                  <label class="check-label select-all-control">
+                    <input id="manifestSelectAll" type="checkbox">
+                    <span>选择当前结果</span>
+                  </label>
+                  <span class="selection-count" id="manifestSelectionCount">已选择 0 项</span>
+                </div>
+                <div class="file-table-wrap">
+                  <table class="file-table">
+                    <thead>
+                      <tr>
+                        <th class="check-column"><span class="sr-only">选择</span></th>
+                        <th>文件 / 路径</th>
+                        <th>备份模式</th>
+                        <th>大小</th>
+                        <th>最后备份时间</th>
+                        <th class="table-action-column">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="manifestFileList"></tbody>
+                  </table>
+                </div>
+                <p class="table-note" id="manifestLimitNote"></p>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-credentials" data-view-panel="credentials">
+          <div class="credentials-intro">
+            <div>
+              <span class="section-kicker">SECURE VAULT</span>
+              <h2>凭据由操作系统安全托管</h2>
+              <p>访问密钥不会保存在浏览器或页面缓存中。保存后，Secret Access Key 将不再显示。</p>
+            </div>
+            <button class="button button-primary" type="button" data-action="new-credential">＋ 添加凭据</button>
+          </div>
+          <div id="credentialList" class="credential-grid"></div>
+        </section>
+
+        <section class="view" id="view-system" data-view-panel="system">
+          <div class="system-grid">
+            <section class="panel system-overview-panel">
+              <div class="section-heading">
+                <div>
+                  <span class="section-kicker">SERVICE</span>
+                  <h2>服务状态</h2>
+                </div>
+                <span class="status-badge neutral" id="systemOverallBadge">检测中</span>
+              </div>
+              <div id="systemDetails" class="definition-list"></div>
+            </section>
+            <section class="panel">
+              <div class="section-heading">
+                <div>
+                  <span class="section-kicker">TOOLS</span>
+                  <h2>外部工具</h2>
+                </div>
+                <button class="button button-secondary small" type="button" data-action="refresh-system">重新检测</button>
+              </div>
+              <div id="systemTools" class="system-tool-grid"></div>
+            </section>
+          </div>
+          <section class="panel safety-panel">
+            <span class="safety-mark" aria-hidden="true">✓</span>
+            <div>
+              <h2>安全边界</h2>
+              <p>控制台通过同源 API 与本地服务通信；敏感凭据只发送到系统密钥环，不写入浏览器存储。远程模式通过 HttpOnly 会话 Cookie 验证 API 与 WebSocket。</p>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div class="mobile-scrim" id="mobileScrim"></div>
+
+  <dialog class="modal compact-modal" id="authDialog">
+    <form id="authForm" novalidate autocomplete="off">
+      <div class="modal-header">
+        <div>
+          <span class="section-kicker">SECURE SESSION</span>
+          <h2>验证控制台访问</h2>
+          <p>服务已启用 API Token，请验证后继续。</p>
+        </div>
+      </div>
+      <div class="modal-body form-sections">
+        <label class="field">
+          <span>API Token <b>*</b></span>
+          <input id="authToken" type="password" required autocomplete="current-password" spellcheck="false">
+          <small>Token 仅用于换取 HttpOnly 会话，不会写入浏览器存储或 WebSocket URL。</small>
+        </label>
+      </div>
+      <div class="modal-footer">
+        <span class="form-status" id="authFormStatus" aria-live="polite"></span>
+        <button class="button button-primary" id="authSubmitButton" type="submit">验证并进入</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal wide-modal" id="taskDialog">
+    <form method="dialog" id="taskForm" novalidate>
+      <div class="modal-header">
+        <div>
+          <span class="section-kicker">BACKUP PLAN</span>
+          <h2 id="taskDialogTitle">新建备份任务</h2>
+          <p>定义数据来源、存储目标与自动运行规则。</p>
+        </div>
+        <button class="icon-button close-dialog" type="button" data-close-dialog="taskDialog" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body form-sections">
+        <input id="taskId" type="hidden">
+
+        <fieldset class="form-section">
+          <legend><span>01</span> 基本信息</legend>
+          <div class="form-grid two">
+            <label class="field">
+              <span>任务名称 <b>*</b></span>
+              <input id="taskName" name="name" type="text" maxlength="120" required placeholder="例如：工作文档">
+              <small class="field-error" data-error-for="name"></small>
+            </label>
+            <label class="field">
+              <span>源目录 <b>*</b></span>
+              <input id="taskSourcePath" name="source_path" type="text" required placeholder="D:\Documents 或 /home/me/docs">
+              <small class="field-error" data-error-for="source_path"></small>
+            </label>
+          </div>
+          <div class="form-grid three">
+            <label class="field">
+              <span>运行频率</span>
+              <select id="taskSchedulePreset">
+                <option value="manual">仅手动运行</option>
+                <option value="hourly">每小时整点</option>
+                <option value="daily-2">每天 02:00</option>
+                <option value="daily-23">每天 23:00</option>
+                <option value="weekly-1">每周一 02:00</option>
+                <option value="custom">自定义 Cron</option>
+              </select>
+              <small>选择常用频率，或切换为自定义。</small>
+            </label>
+            <label class="field" id="taskScheduleField">
+              <span>Cron 表达式</span>
+              <input id="taskSchedule" name="schedule" type="text" placeholder="例如：0 2 * * *（留空为手动）">
+              <small>使用服务所在时区；五段表达式。</small>
+              <small class="field-error" data-error-for="schedule"></small>
+            </label>
+            <label class="switch-field">
+              <input id="taskEnabled" name="enabled" type="checkbox" checked>
+              <span class="switch" aria-hidden="true"></span>
+              <span><strong>启用自动运行</strong><small>关闭后仍可手动执行</small></span>
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset class="form-section">
+          <legend><span>02</span> 存储目标</legend>
+          <div class="storage-kind-picker" role="radiogroup" aria-label="存储类型">
+            <label>
+              <input type="radio" name="storage_kind" value="local" checked>
+              <span><b>本地目录</b><small>外置硬盘、NAS 挂载点</small></span>
+            </label>
+            <label>
+              <input type="radio" name="storage_kind" value="s3">
+              <span><b>S3 / OSS</b><small>兼容 S3 协议的对象存储</small></span>
+            </label>
+          </div>
+
+          <div id="localStorageFields">
+            <label class="field">
+              <span>备份存放目录 <b>*</b></span>
+              <input id="localStoragePath" name="storage.path" type="text" placeholder="E:\Backups 或 /mnt/backup">
+              <small class="field-error" data-error-for="storage.path"></small>
+            </label>
+          </div>
+
+          <div id="s3StorageFields" class="is-hidden">
+            <div class="form-grid three">
+              <label class="field">
+                <span>Bucket <b>*</b></span>
+                <input id="s3Bucket" name="storage.bucket" type="text" placeholder="my-backups">
+                <small class="field-error" data-error-for="storage.bucket"></small>
+              </label>
+              <label class="field">
+                <span>对象前缀</span>
+                <input id="s3Prefix" name="storage.prefix" type="text" value="easybackup" placeholder="easybackup">
+              </label>
+              <label class="field">
+                <span>凭据配置</span>
+                <input id="s3CredentialProfile" name="storage.credential_profile" type="text" value="default" list="credentialProfileOptions" placeholder="default">
+                <datalist id="credentialProfileOptions"></datalist>
+              </label>
+            </div>
+            <div class="form-grid two">
+              <label class="field">
+                <span>Endpoint URL</span>
+                <input id="s3Endpoint" name="storage.endpoint_url" type="url" placeholder="留空使用 AWS；OSS/MinIO 请填写">
+              </label>
+              <label class="field">
+                <span>Region</span>
+                <input id="s3Region" name="storage.region" type="text" placeholder="例如：ap-east-1">
+              </label>
+            </div>
+            <div class="form-grid two">
+              <label class="field">
+                <span>存储类别</span>
+                <input id="s3StorageClass" name="storage.storage_class" type="text" placeholder="例如：STANDARD_IA">
+              </label>
+              <label class="field">
+                <span>分片大小（MB）</span>
+                <input id="s3ChunkSize" name="storage.multipart_chunk_mb" type="number" min="5" max="512" value="16">
+              </label>
+            </div>
+          </div>
+          <div class="storage-test-bar">
+            <span>
+              <strong>连接检测</strong>
+              <small id="storageTestStatus" aria-live="polite">保存任务前，可验证写入、读取与删除权限。</small>
+            </span>
+            <button class="button button-secondary small" id="testStorageButton" type="button">检测配置</button>
+          </div>
+        </fieldset>
+
+        <fieldset class="form-section">
+          <legend><span>03</span> 备份策略</legend>
+          <div class="form-grid four">
+            <label class="field">
+              <span>压缩算法</span>
+              <select id="taskCompression" name="compression">
+                <option value="auto">自动选择</option>
+                <option value="zstd">Zstandard</option>
+                <option value="gzip">Gzip</option>
+                <option value="none">不压缩</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>压缩级别</span>
+              <input id="taskCompressionLevel" name="compression_level" type="number" min="1" max="19" value="3">
+            </label>
+            <label class="field">
+              <span>归档分片（MB）</span>
+              <input id="taskShardSize" name="shard_size_mb" type="number" min="8" max="4096" value="256">
+            </label>
+            <label class="field">
+              <span>全量基线周期</span>
+              <input id="taskFullEvery" name="full_every" type="number" min="1" max="1000" value="6">
+              <small>完成该次数的增量后重新建立全量 Base。</small>
+            </label>
+          </div>
+          <div class="strategy-presets" aria-label="常用全量基线周期">
+            <span>快速选择</span>
+            <button type="button" data-full-every="1">每 2 次运行</button>
+            <button class="is-active" type="button" data-full-every="6">每周周期 · 6 次增量</button>
+            <button type="button" data-full-every="29">每月周期 · 29 次增量</button>
+          </div>
+          <div class="form-grid three">
+            <label class="field">
+              <span>保留完整链数</span>
+              <input id="taskRetentionChains" name="retention_chains" type="number" min="1" max="1000" value="3">
+            </label>
+            <label class="field">
+              <span>保留天数</span>
+              <input id="taskRetentionDays" name="retention_days" type="number" min="1" max="36500" value="30">
+            </label>
+            <label class="switch-field compact-switch">
+              <input id="taskFollowSymlinks" name="follow_symlinks" type="checkbox">
+              <span class="switch" aria-hidden="true"></span>
+              <span><strong>跟随符号链接</strong><small>仅跟随仍位于源目录内的链接</small></span>
+            </label>
+          </div>
+          <div class="delta-settings" id="deltaSettings">
+            <label class="switch-field delta-switch">
+              <input id="taskDeltaEnabled" name="delta_enabled" type="checkbox" checked>
+              <span class="switch" aria-hidden="true"></span>
+              <span><strong>大文件 xdelta3 差分</strong><small>变化时只传输相对基线的差异</small></span>
+            </label>
+            <div class="form-grid two delta-values">
+              <label class="field">
+                <span>启用阈值（MB）</span>
+                <input id="taskDeltaThreshold" name="delta_threshold_mb" type="number" min="1" max="1048576" value="100">
+                <small class="field-error" data-error-for="delta_threshold_mb"></small>
+              </label>
+              <label class="field">
+                <span>最大差分比例（%）</span>
+                <input id="taskDeltaMaxRatio" name="delta_max_ratio" type="number" min="1" max="100" step="1" value="90">
+                <small class="field-error" data-error-for="delta_max_ratio"></small>
+              </label>
+            </div>
+            <p class="delta-settings-note">差分包达到完整文件的设定比例时，将自动回退为完整备份，避免得不偿失。</p>
+          </div>
+          <label class="field">
+            <span>排除规则</span>
+            <textarea id="taskExcludes" name="excludes" rows="5" placeholder="每行一条 glob 规则"></textarea>
+            <small>每行一条，例如 <code>*.tmp</code> 或 <code>.git/**</code>。</small>
+          </label>
+        </fieldset>
+      </div>
+      <div class="modal-footer">
+        <span class="form-status" id="taskFormStatus" aria-live="polite"></span>
+        <button class="button button-secondary" type="button" data-close-dialog="taskDialog">取消</button>
+        <button class="button button-primary" id="saveTaskButton" type="submit">保存任务</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal compact-modal" id="runDialog">
+    <form method="dialog" id="runForm">
+      <div class="modal-header">
+        <div>
+          <span class="section-kicker">RUN NOW</span>
+          <h2>立即运行备份</h2>
+          <p id="runDialogDescription">任务将加入执行队列。</p>
+        </div>
+        <button class="icon-button close-dialog" type="button" data-close-dialog="runDialog" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <input id="runTaskId" type="hidden">
+        <label class="option-card">
+          <input id="runForceFull" type="checkbox">
+          <span class="option-check" aria-hidden="true">✓</span>
+          <span><strong>强制执行全量备份</strong><small>忽略当前增量链状态，创建新的完整基线。</small></span>
+        </label>
+      </div>
+      <div class="modal-footer">
+        <button class="button button-secondary" type="button" data-close-dialog="runDialog">取消</button>
+        <button class="button button-primary" id="confirmRunButton" type="submit">开始备份</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal compact-modal" id="restoreDialog">
+    <form method="dialog" id="restoreForm" novalidate>
+      <div class="modal-header">
+        <div>
+          <span class="section-kicker">RESTORE</span>
+          <h2>还原快照</h2>
+          <p id="restoreSelectionSummary">确认还原范围与目标目录。</p>
+        </div>
+        <button class="icon-button close-dialog" type="button" data-close-dialog="restoreDialog" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body form-sections">
+        <div class="restore-dependency-note is-hidden" id="restoreDependencyNote"></div>
+        <label class="field">
+          <span>还原到 <b>*</b></span>
+          <input id="restoreDestination" type="text" required placeholder="D:\Recovered 或 /tmp/recovered">
+          <small class="field-error" data-error-for="destination_path"></small>
+        </label>
+        <label class="switch-field">
+          <input id="restoreAll" type="checkbox">
+          <span class="switch" aria-hidden="true"></span>
+          <span><strong>还原整个快照</strong><small>开启后忽略当前文件选择</small></span>
+        </label>
+        <label class="field">
+          <span>同名文件处理</span>
+          <select id="restoreOverwrite">
+            <option value="skip">跳过已有文件</option>
+            <option value="rename">自动重命名</option>
+            <option value="overwrite">覆盖已有文件</option>
+          </select>
+        </label>
+        <label class="check-label">
+          <input id="restoreVerify" type="checkbox" checked>
+          <span>还原完成后校验文件完整性</span>
+        </label>
+      </div>
+      <div class="modal-footer">
+        <button class="button button-secondary" type="button" data-close-dialog="restoreDialog">取消</button>
+        <button class="button button-primary" id="confirmRestoreButton" type="submit">开始还原</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal compact-modal" id="scrubDialog">
+    <form method="dialog" id="scrubForm">
+      <div class="modal-header">
+        <div>
+          <span class="section-kicker">INTEGRITY</span>
+          <h2>快照完整性巡检</h2>
+          <p>抽样校验可快速发现远端数据静默损坏。</p>
+        </div>
+        <button class="icon-button close-dialog" type="button" data-close-dialog="scrubDialog" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body form-sections">
+        <label class="switch-field">
+          <input id="scrubDeep" type="checkbox">
+          <span class="switch" aria-hidden="true"></span>
+          <span><strong>深度巡检</strong><small>完整读取并验证所有归档，耗时更长</small></span>
+        </label>
+        <label class="field" id="scrubRatioField">
+          <span>抽样比例 <output id="scrubRatioOutput">1%</output></span>
+          <input id="scrubRatio" type="range" min="1" max="100" value="1">
+        </label>
+      </div>
+      <div class="modal-footer">
+        <button class="button button-secondary" type="button" data-close-dialog="scrubDialog">取消</button>
+        <button class="button button-primary" type="submit">开始巡检</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal compact-modal" id="credentialDialog">
+    <form method="dialog" id="credentialForm" novalidate autocomplete="off">
+      <div class="modal-header">
+        <div>
+          <span class="section-kicker">CREDENTIAL</span>
+          <h2 id="credentialDialogTitle">添加 S3 凭据</h2>
+          <p>密钥将直接写入操作系统安全存储。</p>
+        </div>
+        <button class="icon-button close-dialog" type="button" data-close-dialog="credentialDialog" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body form-sections">
+        <label class="field">
+          <span>配置名称 <b>*</b></span>
+          <input id="credentialProfile" name="profile" type="text" maxlength="120" required placeholder="例如：aliyun-prod" autocomplete="off">
+          <small class="field-error" data-error-for="profile"></small>
+        </label>
+        <label class="field">
+          <span>Access Key ID <b>*</b></span>
+          <input id="credentialAccessKey" name="access_key_id" type="text" required autocomplete="off" spellcheck="false">
+          <small class="field-error" data-error-for="access_key_id"></small>
+        </label>
+        <label class="field">
+          <span>Secret Access Key <b>*</b></span>
+          <div class="password-control">
+            <input id="credentialSecretKey" name="secret_access_key" type="password" required autocomplete="new-password" spellcheck="false">
+            <button id="toggleSecretButton" type="button" aria-label="显示密钥">显示</button>
+          </div>
+          <small class="field-error" data-error-for="secret_access_key"></small>
+        </label>
+        <label class="field">
+          <span>Session Token <i>可选</i></span>
+          <textarea id="credentialSessionToken" name="session_token" rows="3" autocomplete="off" spellcheck="false"></textarea>
+        </label>
+      </div>
+      <div class="modal-footer">
+        <span class="secret-note">🔒 使用系统安全凭据库加密托管；页面不会记住这些内容</span>
+        <button class="button button-secondary" type="button" data-close-dialog="credentialDialog">取消</button>
+        <button class="button button-primary" id="saveCredentialButton" type="submit">安全保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal confirm-modal compact-modal" id="confirmDialog">
+    <form method="dialog" id="confirmForm">
+      <div class="confirm-icon" id="confirmIcon" aria-hidden="true">!</div>
+      <h2 id="confirmTitle">确认操作</h2>
+      <p id="confirmMessage"></p>
+      <div class="modal-footer centered">
+        <button class="button button-secondary" type="button" data-close-dialog="confirmDialog">取消</button>
+        <button class="button button-danger" id="confirmActionButton" type="submit">确认</button>
+      </div>
+    </form>
+  </dialog>
+
+  <aside class="activity-dock is-hidden" id="activityDock" aria-live="polite" aria-label="实时操作进度">
+    <div class="activity-dock-head">
+      <span class="activity-dock-icon" aria-hidden="true">↯</span>
+      <span>
+        <small>LIVE OPERATION</small>
+        <strong id="activityDockTitle">正在执行备份</strong>
+      </span>
+      <button class="activity-dock-close" id="activityDockDismiss" type="button" aria-label="暂时收起进度">×</button>
+    </div>
+    <p id="activityDockPhase">正在等待进度…</p>
+    <div class="activity-progress" role="progressbar" aria-label="操作进度">
+      <span id="activityDockProgress"></span>
+    </div>
+    <div class="activity-dock-meta">
+      <span id="activityDockStats">准备中</span>
+      <strong id="activityDockPercent">—</strong>
+    </div>
+    <button class="text-button" id="activityDockOpen" type="button">查看详细日志 →</button>
+  </aside>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+
+  <template id="emptyStateTemplate">
+    <div class="empty-state">
+      <span class="empty-glyph" aria-hidden="true">◇</span>
+      <h3></h3>
+      <p></p>
+      <button class="button button-secondary is-hidden" type="button"></button>
+    </div>
+  </template>
+
+  <script type="module" src="/static/app.js?v=20260731-ui3"></script>
+</body>
+</html>

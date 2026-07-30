@@ -1,0 +1,106 @@
+@startuml
+!pragma layout smetana
+title EasyBackup SQLite Schema v2
+
+left to right direction
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam roundCorner 10
+skinparam linetype ortho
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontColor #0F172A
+skinparam ArrowColor #64748B
+skinparam ArrowThickness 1.2
+skinparam EntityBorderColor #2563EB
+skinparam EntityBackgroundColor #EFF6FF
+skinparam NoteBorderColor #F59E0B
+skinparam NoteBackgroundColor #FFFBEB
+
+entity "tasks" as Tasks {
+  * id : TEXT <<PK>>
+  --
+  name : TEXT <<UNIQUE>>
+  source_path : TEXT
+  storage / excludes : JSON TEXT
+  schedule / enabled
+  compression / shard_size_mb
+  full_every / retention_*
+  delta_enabled / threshold / ratio
+}
+
+entity "snapshots" as Snapshots {
+  * id : TEXT <<PK>>
+  --
+  task_id : TEXT <<FK>>
+  kind : full | incremental
+  chain_id : TEXT
+  parent_snapshot_id : TEXT
+  status : running | completed | failed
+  manifest_key : TEXT
+  storage / archives / integrity : JSON TEXT
+}
+
+entity "file_state" as FileState {
+  * task_id : TEXT <<PK, FK>>
+  * path : TEXT <<PK>>
+  --
+  size / mtime_ns / mode
+  sha256 : TEXT
+  origin_snapshot_id : TEXT
+  archive_id : TEXT
+  file_version : JSON TEXT
+}
+
+entity "file_versions" as Versions {
+  * id : TEXT UUID <<PK>>
+  --
+  task_id : TEXT <<FK>>
+  snapshot_id : TEXT <<FK>>
+  chain_id / file_path
+  kind : full | delta
+  base_version_id : TEXT <<self FK>>
+  archive_id / object_key
+  compression
+  original_size / transfer_size
+  sha256 / created_at
+}
+
+entity "operations" as Operations {
+  * id : TEXT <<PK>>
+  --
+  task_id : TEXT <<FK>>
+  snapshot_id : TEXT <<FK, nullable>>
+  kind : backup | restore | scrub | prune
+  status / phase / progress
+  stats : JSON TEXT
+  error / timestamps
+}
+
+Tasks ||--o{ Snapshots : "FK · ON DELETE CASCADE"
+Tasks ||--o{ FileState : "FK · ON DELETE CASCADE"
+Tasks ||--o{ Versions : "FK · ON DELETE CASCADE"
+Tasks ||--o{ Operations : "FK · ON DELETE CASCADE"
+Snapshots ||--o{ Versions : "FK · ON DELETE CASCADE"
+Snapshots |o--o{ Operations : "FK · ON DELETE SET NULL"
+Versions |o--o{ Versions : "base_version_id · NO ACTION"
+
+Snapshots ..> Snapshots : "parent_snapshot_id（逻辑关系）"
+FileState ..> Snapshots : "origin_snapshot_id（逻辑关系）"
+FileState ..> Versions : "file_version JSON（逻辑引用）"
+
+note bottom of Versions
+  CHECK 约束：
+  full  → base_version_id IS NULL
+  delta → base_version_id IS NOT NULL
+
+  Base-relative 模式下，delta 直接引用当前链中该路径的完整 Base，
+  而不是引用上一个 delta。
+end note
+
+note bottom of Snapshots
+  chain_id 没有独立 chain 表；
+  一个 full snapshot 的 id 同时成为新 chain_id，
+  后续 incremental snapshot 沿用该值。
+end note
+
+@enduml

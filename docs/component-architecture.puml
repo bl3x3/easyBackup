@@ -1,0 +1,131 @@
+@startuml
+!pragma layout smetana
+title EasyBackup 应用内部组件
+
+top to bottom direction
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam roundCorner 12
+skinparam linetype ortho
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontColor #0F172A
+skinparam ArrowColor #64748B
+skinparam ArrowThickness 1.2
+skinparam componentStyle rectangle
+skinparam ComponentBorderColor #64748B
+skinparam ComponentBackgroundColor #F8FAFC
+skinparam PackageBorderColor #94A3B8
+skinparam PackageBackgroundColor #FFFFFF
+skinparam DatabaseBorderColor #2563EB
+skinparam DatabaseBackgroundColor #EFF6FF
+skinparam InterfaceBorderColor #16A34A
+skinparam InterfaceBackgroundColor #F0FDF4
+skinparam NoteBorderColor #F59E0B
+skinparam NoteBackgroundColor #FFFBEB
+
+component "Browser SPA\nindex.html + app.js" as SPA #EFF6FF
+
+package "FastAPI 控制平面" as Control #EEF2FF {
+  component "Host / Token / Origin /\nSecurity Headers" as Security
+  component "REST API\n/api/v1" as REST
+  component "WebSocket\n/api/v1/ws" as WS
+  component "SchedulerService" as Scheduler
+  component "OperationManager\n每任务单一活动操作" as Manager
+  component "EventBus" as Events
+  component "Application Lifespan\n启动 + 周期 Reconciler" as Lifespan
+}
+
+package "同步工作线程 · asyncio.to_thread" as Workers #F0FDF4 {
+  component "BackupEngine" as Backup
+  component "RestoreEngine" as Restore
+  component "MaintenanceEngine\nScrub + Retention" as Maintenance
+  component "Reconciler" as Reconciler
+}
+
+package "备份 / 恢复模块" as Modules #FFF7ED {
+  component "Scanner + Differ" as Scanner
+  component "Archive + Manifest" as Archive
+  component "Delta Workflow" as Delta
+  component "TaskLock + LeaseGuard" as Locks
+}
+
+package "基础设施适配器" as Adapters #FAF5FF {
+  database "Database\nSQLite WAL" as DB
+  component "CredentialStore" as Credentials
+  interface "BlobStore" as BlobStore
+  component "LocalBlobStore" as Local
+  component "S3BlobStore\nboto3 multipart" as S3
+}
+
+folder "源目录" as Source
+folder "恢复目标目录" as Target
+node "OS Keyring / 机器绑定\nAES-256-GCM 文件" as SecretBackend
+node "外部工具\nxdelta3 · zstd" as Tools
+
+SPA --> Security : HTTP / WebSocket
+Security --> REST
+Security --> WS
+REST --> Manager : 校验与调度
+Scheduler --> Manager : Cron 触发
+Manager --> DB : 创建 / 更新 Operation\n读取 Task / Snapshot
+Manager --> Backup : asyncio.to_thread
+Manager --> Restore : 传入已读取 Snapshot
+Manager --> Maintenance : asyncio.to_thread
+Backup ..> Manager : 进度回调
+Restore ..> Manager : 进度回调
+Maintenance ..> Manager : 进度回调
+Manager --> Events
+Events --> WS
+WS --> SPA : 可丢弃实时事件
+
+Lifespan --> Reconciler : 启动及定时执行
+Reconciler --> DB
+
+Backup --> Scanner
+Backup --> Archive
+Backup --> Delta
+Backup --> Locks
+Backup --> DB : snapshot / file_versions / file_state
+Backup --> Source
+
+Restore --> Archive
+Restore --> Delta
+Restore --> Locks
+Restore --> Target
+
+Maintenance --> Locks
+Maintenance --> DB
+Reconciler --> Archive : Manifest / Commit 验证
+Reconciler --> Locks
+
+Backup --> BlobStore
+Restore --> BlobStore
+Maintenance --> BlobStore
+Reconciler --> BlobStore
+Locks --> BlobStore : 远端 TTL 租约
+
+Local ..|> BlobStore
+S3 ..|> BlobStore
+S3 --> Credentials
+Credentials --> SecretBackend
+Archive --> Tools : zstd（可选）
+Delta --> Tools : xdelta3 + zstd
+
+note bottom of Manager
+  REST 与 SQLite 是状态事实来源。
+  Engine 的进度回调由 Manager 持久化后再发布到 EventBus；
+  WebSocket 断开不会影响后台操作。
+end note
+
+note bottom of Restore
+  RestoreEngine 不查询 file_versions 依赖链。
+  Manager 传入 Snapshot，Engine 从目标 Manifest 的
+  file_version.base 直接读取完整 Base 定位。
+end note
+
+note bottom of Delta
+  生成 Patch 后立即反向解码并校验目标 SHA-256；
+  工具缺失、Base 不可用、验证失败或收益不足时回退完整分卷。
+end note
+
+@enduml

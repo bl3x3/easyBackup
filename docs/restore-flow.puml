@@ -1,0 +1,84 @@
+@startuml
+title EasyBackup 动态架构：选择性恢复流程
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam roundCorner 10
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontColor #0F172A
+skinparam ArrowColor #64748B
+skinparam sequence {
+  ArrowThickness 1.2
+  LifeLineBorderColor #94A3B8
+  LifeLineBackgroundColor #F8FAFC
+  ParticipantBorderColor #64748B
+  ParticipantBackgroundColor #F0FDF4
+  ActorBorderColor #16A34A
+  ActorBackgroundColor #DCFCE7
+  GroupBorderColor #94A3B8
+  GroupBackgroundColor #F8FAFC
+}
+
+hide footbox
+autonumber
+
+actor "用户" as User
+participant "Browser SPA /\nREST API" as API
+participant "OperationManager" as Manager
+database "SQLite" as DB
+participant "RestoreEngine" as Restore
+collections "Local / S3\nBlobStore" as Store
+participant "Safe Archive /\nDelta Modules" as Engine
+participant "目标目录" as Target
+participant "EventBus" as Events
+
+User -> API : 选择快照、文件、目标目录与覆盖策略
+API -> Manager : start_restore(request)
+Manager -> DB : 读取 Snapshot / Task\n创建 queued Operation
+Manager -> Restore : asyncio.to_thread(snapshot, request)
+Restore -> Restore : 获取 TaskLock + 远端 TTL 租约
+Restore -> Store : 下载 manifest.json + commit.json
+Restore -> Restore : 校验 Commit、Manifest 与 snapshot/task/chain 身份
+Restore -> Restore : 规范化选择路径并阻止越界\n预检 xdelta3 / zstd 与平台路径
+Restore -> Restore : 映射最小分卷集合\n区分 normal / delta 文件
+
+loop 每个所选文件
+  alt 普通文件或完整大文件
+    Restore -> Store : 只读取包含目标文件的分卷
+    Store --> Engine : 已压缩 tar 字节流
+    Engine -> Engine : 总是校验对象大小与 SHA-256\n安全解包指定成员和写入上限
+    Engine -> Engine : request.verify=true 时\n校验文件逻辑 SHA-256
+  else Base-relative 差分大文件
+    Restore -> Store : 按 Manifest.file_version.base\n读取完整 Base 对象
+    Store --> Engine : 校验对象后抽取并校验 Base 文件
+    Restore -> Store : 下载该快照唯一 Patch
+    Store --> Engine : 校验后的 .vcdiff.zst
+    Engine -> Engine : zstd 有界解压\nxdelta3(Base, Patch) → Current
+    Engine -> Engine : 无论 verify 取值\n强制校验目标大小与 SHA-256
+  end
+
+  Engine -> Target : 写入目标同目录临时文件
+  Target -> Target : 按 skip / overwrite / rename\n原子发布并恢复时间与权限
+  Restore --> Manager : 文件级进度回调
+  Manager -> DB : 更新 Operation
+  Manager -> Events : 发布进度
+end
+
+Restore --> Manager : completed / failed / cancelled
+Manager -> DB : 持久化最终状态
+Manager -> Events : 发布最终统计
+Events --> API : WebSocket 实时更新
+API --> User : REST 返回最终可核验状态
+
+note over Restore,Engine
+  RestoreEngine 不查询 file_versions 链。
+  差分依赖来自目标 Manifest 内自包含的 Base 定位，
+  所以恢复始终为 Base + 当天 Patch → 目标文件，深度恒为 1。
+end note
+
+note over Restore,Target
+  绝对路径、..、跨目标根目录链接、平台非法名称和冲突路径会被拒绝；
+  工具与路径预检通过前不会创建恢复目标目录。
+end note
+
+@enduml

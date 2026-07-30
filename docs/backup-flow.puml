@@ -1,0 +1,100 @@
+@startuml
+title EasyBackup 动态架构：备份流程
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam roundCorner 10
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontColor #0F172A
+skinparam ArrowColor #64748B
+skinparam sequence {
+  ArrowThickness 1.2
+  LifeLineBorderColor #94A3B8
+  LifeLineBackgroundColor #F8FAFC
+  ParticipantBorderColor #64748B
+  ParticipantBackgroundColor #EFF6FF
+  ActorBorderColor #2563EB
+  ActorBackgroundColor #DBEAFE
+  GroupBorderColor #94A3B8
+  GroupBackgroundColor #F8FAFC
+}
+
+hide footbox
+autonumber
+
+actor "用户" as User
+participant "Browser SPA" as SPA
+participant "REST API" as REST
+participant "Scheduler" as Scheduler
+participant "OperationManager" as Manager
+database "SQLite" as DB
+participant "BackupEngine" as Backup
+participant "Scanner / Delta /\nArchive Modules" as Engine
+collections "Local / S3\nBlobStore" as Store
+participant "EventBus" as Events
+
+User -> SPA : 点击运行
+SPA -> REST : POST /tasks/{id}/run
+REST -> Manager : start_backup(task_id)
+Scheduler -> Manager : Cron 触发同一入口
+Manager -> DB : 校验任务并创建 queued Operation
+Manager -> Backup : asyncio.to_thread(backup_and_prune)
+
+Backup -> Backup : 获取 TaskLock\n拒绝未对账 RUNNING Snapshot
+Backup -> Store : LeaseGuard 获取任务级 TTL 租约
+Backup -> DB : 在锁内选择 lineage\n判断 full_due / 存储或源变化
+Backup -> DB : 插入 RUNNING Snapshot
+Backup -> Engine : 扫描、变化识别与 SHA-256
+
+alt 新链 / 强制全量 / full_every 到期
+  Engine -> Engine : 全部文件进入多分卷规划\n大文件完整 Base 独占分卷
+else 当前链增量
+  Engine -> Engine : 未变化文件沿用历史对象\n小变化文件进入多分卷
+  loop 每个达到 delta_threshold_mb 的变化大文件
+    Backup -> DB : 查询当前链、当前路径的完整 Base
+    alt Base 可验证且 xdelta3 / zstd 可用
+      Engine -> Engine : 固定 Current\nxdelta3(Base, Current) → Patch\nzstd 压缩
+      Engine -> Engine : 立即反向解码\n校验目标大小与 SHA-256
+      alt Patch < delta_max_ratio × 原文件
+        Backup -> Store : 上传 .vcdiff.zst
+        Backup -> DB : 暂存 delta → Base ID
+      else 收益不足
+        Engine -> Engine : 回退独立完整分卷
+      end
+    else 无 Base / 工具缺失 / 验证失败
+      Engine -> Engine : 回退独立完整分卷
+    end
+  end
+end
+
+Backup -> Store : 流式上传 tar.zst / tar.gz 分卷\n记录对象 SHA-256 + block CRC32
+Backup -> Engine : 再次确认源文件未变化
+Backup -> Store : 上传 manifest.json
+Backup -> Store : LeaseGuard.ensure_valid()
+Backup -> Store : 最后发布 commit.json
+Backup -> DB : commit_snapshot 原子更新\nsnapshot + file_versions + file_state
+
+Backup --> Manager : 结果 / 进度回调
+Manager -> DB : 持久化 Operation 状态与统计
+Manager -> Events : 发布状态事件
+Events --> SPA : WebSocket 实时更新
+Backup -> Store : 释放远端租约
+Manager --> REST : 返回可查询 Operation
+REST --> SPA : REST 状态为事实来源
+
+note over Engine,Store
+  Base-relative：同一链内每个 Patch 都直接依赖该文件的完整 Base，
+  不形成 Patch1 → Patch2 → Patch3 的串行依赖链。
+end note
+
+note over Backup,DB
+  commit.json 发布前失败且仍持有租约：逆序清理未发布对象并标记失败。
+  Commit 已发布但 SQLite 提交失败：保留远端证据，由启动/周期对账补全。
+end note
+
+note over Manager,Backup
+  快照提交后执行 best-effort 保留清理；
+  清理失败会记录日志，但不会把有效备份改成失败。
+end note
+
+@enduml

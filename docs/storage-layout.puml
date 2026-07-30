@@ -1,0 +1,86 @@
+@startuml
+!pragma layout smetana
+title EasyBackup 本地数据目录与 BlobStore 对象布局
+
+left to right direction
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam roundCorner 10
+skinparam linetype ortho
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontColor #0F172A
+skinparam ArrowColor #64748B
+skinparam ArrowThickness 1.2
+skinparam FolderBorderColor #16A34A
+skinparam FolderBackgroundColor #F0FDF4
+skinparam FileBorderColor #64748B
+skinparam FileBackgroundColor #F8FAFC
+skinparam ArtifactBorderColor #2563EB
+skinparam ArtifactBackgroundColor #EFF6FF
+skinparam NoteBorderColor #F59E0B
+skinparam NoteBackgroundColor #FFFBEB
+
+folder "EASYBACKUP_DATA_DIR" as DataDir #FAF5FF {
+  file "easybackup.db\n+ WAL / SHM" as Database
+  folder "locks/" as Locks {
+    file "{task_id}.lock" as LocalLock
+  }
+  folder "logs/" as Logs
+  folder "secrets/" as Secrets
+  folder "delta-cache/" as Cache {
+    file "{task_hash}/{chain_hash}/\n{version_hash}.base" as BaseCache
+  }
+}
+
+folder "BlobStore 根\nLocalStorage.path\n或 s3://bucket/{prefix}" as StoreRoot #F0FDF4 {
+  folder "v1/tasks/{task_id}" as TaskPrefix {
+    file "write.lock.json" as Lease
+    folder "chains/{chain_id}/snapshots/{snapshot_id}" as SnapshotPrefix {
+      folder "volumes/" as Volumes {
+        artifact "{snapshot_id}-volume-{NNNNN}\n.tar.zst | .tar.gz | .tar" as Volume
+      }
+      folder "patches/" as Patches {
+        artifact "{snapshot_id}-delta-{NNNNN}\n.vcdiff.zst" as Patch
+      }
+      file "manifest.json" as Manifest
+      file "commit.json" as Commit
+    }
+  }
+}
+
+Database ..> Manifest : snapshots.manifest_key
+Database ..> Volume : full file_version.object_key
+Database ..> Patch : delta file_version.object_key
+Manifest --> Volume : 文件 → 完整分卷
+Manifest --> Patch : 文件 → Patch
+Manifest ..> Volume : delta.base → 完整 Base 分卷
+Commit --> Manifest : manifest_sha256
+Lease ..> SnapshotPrefix : 保护任务级写入
+BaseCache ..> Volume : 缓存可由远端 Base 重建
+
+note bottom of Volume
+  普通文件按目标大小分卷。
+  大文件完整 Base 或差分失败回退会独占一个 tar 分卷，
+  便于未来只读取该文件的 Base。
+end note
+
+note bottom of Patch
+  Patch 是 zstd 压缩的 VCDIFF 对象，不是 tar。
+  Manifest 同时携带该 Patch 及其完整 Base 的自包含定位。
+end note
+
+note bottom of Commit
+  远端发布顺序：
+  volumes / patches
+  → manifest.json
+  → 再次确认租约
+  → commit.json（可见性边界）
+  → SQLite 事务提交
+end note
+
+note bottom of BaseCache
+  delta-cache 是可删除、可重建的明文性能层，
+  不是恢复所需的唯一副本。
+end note
+
+@enduml
