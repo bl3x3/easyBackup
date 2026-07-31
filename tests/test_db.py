@@ -7,6 +7,7 @@ from easybackup.models import (
     LocalStorageConfig,
     OperationKind,
     OperationStatus,
+    SFTPStorageConfig,
     Snapshot,
     SnapshotKind,
     SnapshotStatus,
@@ -54,6 +55,45 @@ def test_task_and_operation_round_trip(database, tmp_path):
     assert database.mark_interrupted_operations() == 2
     assert database.get_operation(operation.id).status == OperationStatus.FAILED
     assert database.get_operation(queued.id).status == OperationStatus.FAILED
+
+
+def test_sftp_task_storage_json_round_trip(database, tmp_path):
+    source = tmp_path / "sftp-source"
+    source.mkdir()
+    storage = SFTPStorageConfig(
+        host="Backup.Internal.Example",
+        port=2222,
+        base_path="/srv/easybackup",
+        credential_profile="sftp-prod",
+        host_key_fingerprint=(
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ),
+        connect_timeout_seconds=30,
+    )
+
+    created = database.create_task(
+        TaskCreate(
+            name="sftp-documents",
+            source_path=str(source),
+            storage=storage,
+        )
+    )
+    loaded = database.get_task(created.id)
+
+    assert isinstance(loaded.storage, SFTPStorageConfig)
+    assert loaded.storage.model_dump(mode="json") == {
+        "kind": "sftp",
+        "host": "backup.internal.example",
+        "port": 2222,
+        "base_path": "/srv/easybackup",
+        "credential_profile": "sftp-prod",
+        "host_key_fingerprint": (
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ),
+        "known_hosts_path": None,
+        "connect_timeout_seconds": 30,
+    }
+    assert database.list_tasks()[0].storage == loaded.storage
 
 
 def test_snapshot_commit_replaces_file_state(database, tmp_path):

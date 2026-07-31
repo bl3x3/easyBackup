@@ -301,7 +301,7 @@
             <div>
               <span class="section-kicker">SECURE VAULT</span>
               <h2>凭据由操作系统安全托管</h2>
-              <p>访问密钥不会保存在浏览器或页面缓存中。保存后，Secret Access Key 将不再显示。</p>
+              <p>S3 访问密钥、SFTP 密码和私钥不会保存在浏览器或页面缓存中，保存后不再回显。</p>
             </div>
             <button class="button button-primary" type="button" data-action="new-credential">＋ 添加凭据</button>
           </div>
@@ -433,6 +433,10 @@
               <input type="radio" name="storage_kind" value="s3">
               <span><b>S3 / OSS</b><small>兼容 S3 协议的对象存储</small></span>
             </label>
+            <label>
+              <input type="radio" name="storage_kind" value="sftp">
+              <span><b>SFTP</b><small>通过 SSH 传输到远程服务器</small></span>
+            </label>
           </div>
 
           <div id="localStorageFields">
@@ -456,8 +460,8 @@
               </label>
               <label class="field">
                 <span>凭据配置</span>
-                <input id="s3CredentialProfile" name="storage.credential_profile" type="text" value="default" list="credentialProfileOptions" placeholder="default">
-                <datalist id="credentialProfileOptions"></datalist>
+                <input id="s3CredentialProfile" name="storage.credential_profile" type="text" value="default" list="s3CredentialProfileOptions" placeholder="default">
+                <datalist id="s3CredentialProfileOptions"></datalist>
               </label>
             </div>
             <div class="form-grid two">
@@ -480,6 +484,55 @@
               <label class="field">
                 <span>分片大小（MB）</span>
                 <input id="s3ChunkSize" name="storage.multipart_chunk_mb" type="number" min="5" max="512" value="16">
+              </label>
+            </div>
+          </div>
+
+          <div id="sftpStorageFields" class="is-hidden">
+            <div class="form-grid three">
+              <label class="field">
+                <span>服务器主机 <b>*</b></span>
+                <input id="sftpHost" name="storage.host" type="text" placeholder="backup.example.com" autocomplete="off" spellcheck="false">
+                <small>只填写域名或 IP 地址，不要包含 <code>sftp://</code>。</small>
+                <small class="field-error" data-error-for="storage.host"></small>
+              </label>
+              <label class="field">
+                <span>SSH 端口 <b>*</b></span>
+                <input id="sftpPort" name="storage.port" type="number" min="1" max="65535" value="22">
+                <small class="field-error" data-error-for="storage.port"></small>
+              </label>
+              <label class="field">
+                <span>凭据配置</span>
+                <input id="sftpCredentialProfile" name="storage.credential_profile" type="text" value="default" list="sftpCredentialProfileOptions" placeholder="default">
+                <datalist id="sftpCredentialProfileOptions"></datalist>
+                <small class="field-error" data-error-for="storage.credential_profile"></small>
+              </label>
+            </div>
+            <div class="form-grid two">
+              <label class="field">
+                <span>远端根目录 <b>*</b></span>
+                <input id="sftpBasePath" name="storage.base_path" type="text" value="easybackup" placeholder="easybackup">
+                <small>默认相对于 SFTP 登录目录，也可填写服务器允许访问的绝对 POSIX 路径。</small>
+                <small class="field-error" data-error-for="storage.base_path"></small>
+              </label>
+              <label class="field">
+                <span>连接超时（秒）</span>
+                <input id="sftpConnectTimeout" name="storage.connect_timeout_seconds" type="number" min="1" max="120" value="15">
+                <small class="field-error" data-error-for="storage.connect_timeout_seconds"></small>
+              </label>
+            </div>
+            <div class="form-grid two">
+              <label class="field">
+                <span>主机密钥指纹 <i>可选</i></span>
+                <input id="sftpHostKeyFingerprint" name="storage.host_key_fingerprint" type="text" placeholder="SHA256:..." autocomplete="off" spellcheck="false">
+                <small>建议填写已线下核验的 OpenSSH SHA256 指纹；留空时使用 known_hosts 验证。</small>
+                <small class="field-error" data-error-for="storage.host_key_fingerprint"></small>
+              </label>
+              <label class="field">
+                <span>known_hosts 路径 <i>可选</i></span>
+                <input id="sftpKnownHostsPath" name="storage.known_hosts_path" type="text" placeholder="留空使用系统默认 known_hosts">
+                <small>路径位于运行 EasyBackup 的主机，而不是当前浏览器所在设备。</small>
+                <small class="field-error" data-error-for="storage.known_hosts_path"></small>
               </label>
             </div>
           </div>
@@ -508,7 +561,7 @@
           <details class="storage-troubleshooting">
             <summary>
               <span>连接不上？查看常见配置错误</span>
-              <small>Endpoint、网络、权限与签名排查</small>
+              <small>服务地址、网络、身份验证与权限排查</small>
             </summary>
             <div class="storage-troubleshooting-grid">
               <article>
@@ -534,6 +587,18 @@
               <article>
                 <b>PublicEndpointForbidden</b>
                 <p>阿里云禁止默认公网 Endpoint 时，请使用绑定到 Bucket 的自定义 CNAME；同地域云主机也可改用内网 Endpoint。</p>
+              </article>
+              <article>
+                <b>SFTP 主机密钥</b>
+                <p>首次连接或服务器密钥变更时，请向管理员线下核验 <code>SHA256:...</code> 指纹。不要在未核验时绕过主机身份检查。</p>
+              </article>
+              <article>
+                <b>SFTP 认证</b>
+                <p>确认凭据类型为 SFTP、用户名正确，并按服务器要求配置密码或完整私钥；加密私钥还需要正确的 Passphrase。</p>
+              </article>
+              <article>
+                <b>SFTP 目录与配额</b>
+                <p>确认远端根目录可创建，且账号具有列出、写入、读取、重命名和删除权限，同时检查服务器剩余空间与磁盘配额。</p>
               </article>
             </div>
           </details>
@@ -721,34 +786,87 @@
       <div class="modal-header">
         <div>
           <span class="section-kicker">CREDENTIAL</span>
-          <h2 id="credentialDialogTitle">添加 S3 凭据</h2>
-          <p>密钥将直接写入操作系统安全存储。</p>
+          <h2 id="credentialDialogTitle">添加存储凭据</h2>
+          <p>敏感信息将直接写入操作系统安全存储。</p>
         </div>
         <button class="icon-button close-dialog" type="button" data-close-dialog="credentialDialog" aria-label="关闭">×</button>
       </div>
       <div class="modal-body form-sections">
+        <div class="credential-kind-picker" role="radiogroup" aria-label="凭据类型">
+          <label>
+            <input type="radio" name="credential_kind" value="s3" checked>
+            <span><b>S3 / OSS</b><small>Access Key 身份验证</small></span>
+          </label>
+          <label>
+            <input type="radio" name="credential_kind" value="sftp">
+            <span><b>SFTP</b><small>密码或 SSH 私钥认证</small></span>
+          </label>
+        </div>
         <label class="field">
           <span>配置名称 <b>*</b></span>
-          <input id="credentialProfile" name="profile" type="text" maxlength="120" required placeholder="例如：aliyun-prod" autocomplete="off">
+          <input id="credentialProfile" name="profile" type="text" maxlength="120" required placeholder="例如：remote-prod" autocomplete="off">
           <small class="field-error" data-error-for="profile"></small>
         </label>
-        <label class="field">
-          <span>Access Key ID <b>*</b></span>
-          <input id="credentialAccessKey" name="access_key_id" type="text" required autocomplete="off" spellcheck="false">
-          <small class="field-error" data-error-for="access_key_id"></small>
-        </label>
-        <label class="field">
-          <span>Secret Access Key <b>*</b></span>
-          <div class="password-control">
-            <input id="credentialSecretKey" name="secret_access_key" type="password" required autocomplete="new-password" spellcheck="false">
-            <button id="toggleSecretButton" type="button" aria-label="显示密钥">显示</button>
+
+        <div id="s3CredentialFields">
+          <label class="field">
+            <span>Access Key ID <b>*</b></span>
+            <input id="credentialAccessKey" name="access_key_id" type="text" autocomplete="off" spellcheck="false">
+            <small class="field-error" data-error-for="access_key_id"></small>
+          </label>
+          <label class="field">
+            <span>Secret Access Key <b>*</b></span>
+            <div class="password-control">
+              <input id="credentialSecretKey" name="secret_access_key" type="password" autocomplete="new-password" spellcheck="false">
+              <button id="toggleSecretButton" type="button" aria-label="显示密钥">显示</button>
+            </div>
+            <small class="field-error" data-error-for="secret_access_key"></small>
+          </label>
+          <label class="field">
+            <span>Session Token <i>可选</i></span>
+            <textarea id="credentialSessionToken" name="session_token" rows="3" autocomplete="off" spellcheck="false"></textarea>
+          </label>
+        </div>
+
+        <div id="sftpCredentialFields" class="is-hidden">
+          <label class="field">
+            <span>SFTP 用户名 <b>*</b></span>
+            <input id="credentialSftpUsername" name="username" type="text" autocomplete="username" spellcheck="false">
+            <small class="field-error" data-error-for="username"></small>
+          </label>
+          <label class="field">
+            <span>认证方式 <b>*</b></span>
+            <select id="credentialSftpAuthMethod" name="auth_method">
+              <option value="password">密码</option>
+              <option value="private_key">SSH 私钥</option>
+            </select>
+            <small class="field-error" data-error-for="auth_method"></small>
+          </label>
+          <div id="sftpPasswordCredentialFields">
+            <label class="field">
+              <span>SFTP 密码 <b>*</b></span>
+              <div class="password-control">
+                <input id="credentialSftpPassword" name="password" type="password" autocomplete="new-password" spellcheck="false">
+                <button id="toggleSftpPasswordButton" type="button" aria-label="显示密码">显示</button>
+              </div>
+              <small>密码会按原样保存，包括可能存在的前后空格。</small>
+              <small class="field-error" data-error-for="password"></small>
+            </label>
           </div>
-          <small class="field-error" data-error-for="secret_access_key"></small>
-        </label>
-        <label class="field">
-          <span>Session Token <i>可选</i></span>
-          <textarea id="credentialSessionToken" name="session_token" rows="3" autocomplete="off" spellcheck="false"></textarea>
-        </label>
+          <div id="sftpPrivateKeyCredentialFields" class="is-hidden">
+            <label class="field">
+              <span>SSH 私钥 <b>*</b></span>
+              <textarea id="credentialSftpPrivateKey" name="private_key" rows="8" autocomplete="off" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+              <small>粘贴完整的 OpenSSH 或 PEM 私钥内容。</small>
+              <small class="field-error" data-error-for="private_key"></small>
+            </label>
+            <label class="field">
+              <span>私钥 Passphrase <i>可选</i></span>
+              <input id="credentialSftpPassphrase" name="private_key_passphrase" type="password" autocomplete="new-password" spellcheck="false">
+              <small class="field-error" data-error-for="private_key_passphrase"></small>
+            </label>
+          </div>
+        </div>
       </div>
       <div class="modal-footer">
         <span class="secret-note">🔒 使用系统安全凭据库加密托管；页面不会记住这些内容</span>

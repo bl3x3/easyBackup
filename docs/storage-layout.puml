@@ -17,6 +17,8 @@ skinparam FileBorderColor #64748B
 skinparam FileBackgroundColor #F8FAFC
 skinparam ArtifactBorderColor #2563EB
 skinparam ArtifactBackgroundColor #EFF6FF
+skinparam NodeBorderColor #64748B
+skinparam NodeBackgroundColor #F8FAFC
 skinparam NoteBorderColor #F59E0B
 skinparam NoteBackgroundColor #FFFBEB
 
@@ -32,9 +34,12 @@ folder "EASYBACKUP_DATA_DIR" as DataDir #FAF5FF {
   }
 }
 
-folder "BlobStore 根\nLocalStorage.path\n或 s3://bucket/{prefix}" as StoreRoot #F0FDF4 {
+node "SFTP / SSH 服务器\nOPEN_EXCL · posix-rename\n至少两个并发会话" as SFTPServer
+
+folder "BlobStore 根\nLocalStorage.path\ns3://bucket/{prefix}\n或 sftp://host/{base_path}" as StoreRoot #F0FDF4 {
   folder "v1/tasks/{task_id}" as TaskPrefix {
     file "write.lock.json" as Lease
+    file "write.lock.json.cas.guard\nSFTP 租约更新临界区" as LeaseGuard
     folder "chains/{chain_id}/snapshots/{snapshot_id}" as SnapshotPrefix {
       folder "volumes/" as Volumes {
         artifact "{snapshot_id}-volume-{NNNNN}\n.tar.zst | .tar.gz | .tar" as Volume
@@ -48,6 +53,7 @@ folder "BlobStore 根\nLocalStorage.path\n或 s3://bucket/{prefix}" as StoreRoot
   }
 }
 
+SFTPServer --> StoreRoot : SFTP 后端时映射 base_path
 Database ..> Manifest : snapshots.manifest_key
 Database ..> Volume : full file_version.object_key
 Database ..> Patch : delta file_version.object_key
@@ -56,6 +62,7 @@ Manifest --> Patch : 文件 → Patch
 Manifest ..> Volume : delta.base → 完整 Base 分卷
 Commit --> Manifest : manifest_sha256
 Lease ..> SnapshotPrefix : 保护任务级写入
+LeaseGuard --> Lease : OPEN_EXCL 串行化更新
 BaseCache ..> Volume : 缓存可由远端 Base 重建
 
 note bottom of Volume
@@ -76,6 +83,12 @@ note bottom of Commit
   → 再次确认租约
   → commit.json（可见性边界）
   → SQLite 事务提交
+end note
+
+note bottom of LeaseGuard
+  正常情况下 guard 只短暂存在。
+  若客户端在临界区崩溃，EasyBackup 会 fail-closed；
+  确认所有实例停止后才可由管理员手动删除。
 end note
 
 note bottom of BaseCache

@@ -32,6 +32,7 @@ from easybackup.models import (
     SnapshotKind,
     SnapshotStatus,
     S3StorageConfig,
+    SFTPStorageConfig,
     StorageConfig,
     Task,
     TaskCreate,
@@ -896,7 +897,7 @@ class Database:
             for row in rows:
                 storage = _STORAGE_ADAPTER.validate_json(row["storage"])
                 if (
-                    isinstance(storage, S3StorageConfig)
+                    isinstance(storage, (S3StorageConfig, SFTPStorageConfig))
                     and storage.credential_profile == profile
                 ):
                     return str(row["id"])

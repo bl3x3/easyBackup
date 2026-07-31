@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "easybackup"
 version = "0.1.0"
-description = "A maintainable local-first backup control center with incremental snapshots and S3-compatible storage."
+description = "A maintainable local-first backup control center with incremental snapshots, S3-compatible storage, and SFTP."
 readme = "readme.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,6 +15,7 @@ dependencies = [
     "fastapi>=0.115,<1",
     "filelock>=3.15,<4",
     "keyring>=25,<27",
+    "paramiko>=4,<6",
     "pydantic>=2.7,<3",
     "uvicorn[standard]>=0.30,<1",
 ]

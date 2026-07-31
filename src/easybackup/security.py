@@ -24,7 +24,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from easybackup.errors import CredentialError, NotFoundError
+from easybackup.errors import ConflictError, CredentialError, NotFoundError
 from easybackup.models import CredentialStatus, CredentialWrite
 
 
@@ -86,7 +86,7 @@ def _atomic_json_write(path: Path, value: dict[str, Any]) -> None:
 
 
 class CredentialStore:
-    """Store S3-compatible credentials without returning secrets through APIs."""
+    """Store remote-storage credentials without returning secrets through APIs."""
 
     def __init__(self, secret_dir: Path, preference: str = "auto"):
         self.secret_dir = secret_dir
@@ -161,16 +161,25 @@ class CredentialStore:
     @staticmethod
     def _serialize(value: CredentialWrite) -> str:
         return json.dumps(
-            {
-                "access_key_id": value.access_key_id,
-                "secret_access_key": value.secret_access_key,
-                "session_token": value.session_token,
-            },
+            value.model_dump(
+                mode="json",
+                exclude={"profile"},
+                exclude_none=True,
+            ),
             ensure_ascii=False,
         )
 
     def put(self, value: CredentialWrite) -> CredentialStatus:
         with self._lock:
+            index = self._load_index()
+            existing = index["profiles"].get(value.profile)
+            existing_kind = existing.get("kind", "s3") if existing else None
+            if existing_kind is not None and existing_kind != value.kind:
+                raise ConflictError(
+                    f"凭据配置 {value.profile!r} 已用于 {existing_kind.upper()}；"
+                    "为避免任务误用，不能直接改成另一种协议，请新建配置名称。"
+                )
+
             backend = "encrypted_file"
             payload = self._serialize(value)
             if self.preference in {"auto", "keyring"}:
@@ -190,27 +199,49 @@ class CredentialStore:
                 self._write_encrypted_entries(entries)
 
             now = _utc_now()
-            index = self._load_index()
-            index["profiles"][value.profile] = {
+            metadata: dict[str, Any] = {
                 "backend": backend,
-                "access_key_hint": _credential_hint(value.access_key_id),
-                "has_session_token": bool(value.session_token),
+                "kind": value.kind,
                 "updated_at": now,
             }
+            if value.kind == "s3":
+                metadata.update(
+                    {
+                        "access_key_hint": _credential_hint(
+                            value.access_key_id or ""
+                        ),
+                        "has_session_token": bool(value.session_token),
+                    }
+                )
+            else:
+                metadata.update(
+                    {
+                        "identity_hint": value.username,
+                        "auth_method": value.auth_method,
+                        "has_password": bool(value.password),
+                        "has_private_key": bool(value.private_key),
+                    }
+                )
+            index["profiles"][value.profile] = metadata
             _atomic_json_write(self._index_path, index)
-            return CredentialStatus(
-                profile=value.profile,
-                backend=backend,
-                access_key_hint=_credential_hint(value.access_key_id),
-                has_session_token=bool(value.session_token),
-                updated_at=now,
-            )
+            return CredentialStatus(profile=value.profile, **metadata)
 
-    def get(self, profile: str) -> dict[str, str | None]:
+    def get(
+        self,
+        profile: str,
+        *,
+        expected_kind: str | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             metadata = self._load_index().get("profiles", {}).get(profile)
             if not metadata:
                 raise NotFoundError(f"凭据配置 {profile!r} 不存在。")
+            metadata_kind = str(metadata.get("kind", "s3"))
+            if expected_kind is not None and metadata_kind != expected_kind:
+                raise CredentialError(
+                    f"凭据配置 {profile!r} 属于 {metadata_kind.upper()}，"
+                    f"不能用于 {expected_kind.upper()} 存储。"
+                )
             backend = metadata.get("backend")
             payload: str | None
             if backend == "keyring":
@@ -231,19 +262,31 @@ class CredentialStore:
                 raise CredentialError(f"凭据配置 {profile!r} 的秘密内容已丢失。")
             try:
                 value = json.loads(payload)
-            except json.JSONDecodeError as exc:
+            except (TypeError, json.JSONDecodeError) as exc:
                 raise CredentialError("凭据内容已损坏。") from exc
-            return {
-                "access_key_id": value["access_key_id"],
-                "secret_access_key": value["secret_access_key"],
-                "session_token": value.get("session_token"),
-            }
+            if not isinstance(value, dict):
+                raise CredentialError("凭据内容已损坏。")
+            payload_kind = str(value.get("kind", metadata_kind))
+            if payload_kind != metadata_kind:
+                raise CredentialError("凭据元数据与秘密内容的协议类型不一致。")
+            value["kind"] = payload_kind
+            if expected_kind is not None and payload_kind != expected_kind:
+                raise CredentialError(
+                    f"凭据配置 {profile!r} 不能用于 {expected_kind.upper()} 存储。"
+                )
+            return value
 
     def list(self) -> list[CredentialStatus]:
         with self._lock:
             profiles = self._load_index().get("profiles", {})
             return [
-                CredentialStatus(profile=name, **metadata)
+                CredentialStatus(
+                    profile=name,
+                    **{
+                        **metadata,
+                        "kind": metadata.get("kind", "s3"),
+                    },
+                )
                 for name, metadata in sorted(profiles.items())
             ]
 
@@ -297,15 +340,22 @@ def _credential_hint(access_key: str) -> str:
 _SECRET_PATTERNS = [
     re.compile(
         r"(?i)((?:[\"']?)(?:secret[_-]?(?:access[_-]?)?key|"
-        r"session[_-]?token|password)(?:[\"']?)\s*[=:]\s*)"
+        r"session[_-]?token|password|passphrase|private[_-]?key)"
+        r"(?:[\"']?)\s*[=:]\s*)"
         r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
     ),
     re.compile(r"\b(AKIA|ASIA)[A-Z0-9]{12,20}\b"),
+    re.compile(
+        r"-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----.*?"
+        r"-----END (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----",
+        re.IGNORECASE | re.DOTALL,
+    ),
 ]
 
 
 def redact_sensitive(value: str) -> str:
-    redacted = _SECRET_PATTERNS[0].sub(r'\1"****"', value)
+    redacted = _SECRET_PATTERNS[2].sub('"****"', value)
+    redacted = _SECRET_PATTERNS[0].sub(r'\1"****"', redacted)
     redacted = _SECRET_PATTERNS[1].sub(
         lambda match: f"{match.group(0)[:4]}****{match.group(0)[-4:]}",
         redacted,

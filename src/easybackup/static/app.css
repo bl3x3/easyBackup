@@ -1428,6 +1428,11 @@ main {
   color: #38bdf8;
 }
 
+.task-kind-mark.sftp {
+  background: rgba(167, 139, 250, 0.14);
+  color: #a78bfa;
+}
+
 .task-card h2 {
   overflow: hidden;
   margin-bottom: 1px;
@@ -2156,6 +2161,11 @@ main {
   font-size: 18px;
 }
 
+.credential-glyph.sftp {
+  background: rgba(167, 139, 250, 0.14);
+  color: #a78bfa;
+}
+
 .credential-card h2 {
   margin: 13px 0 2px;
   font-size: 15px;
@@ -2649,7 +2659,7 @@ main {
 
 .storage-kind-picker {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 9px;
   margin-bottom: 13px;
 }
@@ -2699,6 +2709,64 @@ main {
 
 .storage-kind-picker input:focus-visible + span {
   box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.35);
+}
+
+.credential-kind-picker {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.credential-kind-picker label {
+  cursor: pointer;
+}
+
+.credential-kind-picker input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.credential-kind-picker span {
+  display: flex;
+  min-height: 56px;
+  flex-direction: column;
+  justify-content: center;
+  padding: 9px 11px;
+  border: 1px solid var(--border-default);
+  border-radius: 9px;
+  background: var(--bg-input);
+  transition: border-color var(--transition), background var(--transition), box-shadow var(--transition);
+}
+
+.credential-kind-picker span:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+}
+
+.credential-kind-picker b {
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.credential-kind-picker small {
+  color: var(--text-faint);
+  font-size: 8px;
+}
+
+.credential-kind-picker input:checked + span {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.credential-kind-picker input:focus-visible + span {
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.35);
+}
+
+.credential-kind-picker input:disabled + span {
+  cursor: not-allowed;
+  opacity: 0.62;
 }
 
 .storage-test-bar {
@@ -3107,6 +3175,12 @@ main {
 .password-control button:hover {
   background: var(--bg-hover);
   color: #93c5fd;
+}
+
+#credentialSftpPrivateKey {
+  min-height: 150px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 9px;
 }
 
 .secret-note {
@@ -3770,6 +3844,10 @@ main {
   }
 
   .storage-kind-picker {
+    grid-template-columns: 1fr;
+  }
+
+  .credential-kind-picker {
     grid-template-columns: 1fr;
   }
 

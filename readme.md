@@ -5,9 +5,9 @@
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi&logoColor=white)
 ![Version](https://img.shields.io/badge/version-0.1.0-2563EB)
-![Storage](https://img.shields.io/badge/storage-Local%20%7C%20S3-16A34A)
+![Storage](https://img.shields.io/badge/storage-Local%20%7C%20S3%20%7C%20SFTP-16A34A)
 
-EasyBackup 通过 Web 控制台管理本地目录到本地仓库或 S3 兼容对象存储的全量、增量备份。它使用多分卷归档降低选择性恢复成本，并对达到阈值的大文件生成 **Base-relative xdelta3 补丁**：同一备份链内的每个补丁都直接依赖完整 Base，因此差分恢复始终只需要 `Base + 当天 Patch`。
+EasyBackup 通过 Web 控制台管理本地目录到本地仓库、S3 兼容对象存储或 SFTP/SSH 服务器的全量、增量备份。它使用多分卷归档降低选择性恢复成本，并对达到阈值的大文件生成 **Base-relative xdelta3 补丁**：同一备份链内的每个补丁都直接依赖完整 Base，因此差分恢复始终只需要 `Base + 当天 Patch`。
 
 ## 目录
 
@@ -26,7 +26,7 @@ EasyBackup 通过 Web 控制台管理本地目录到本地仓库或 S3 兼容对
 
 - **统一控制中心**：FastAPI REST、Swagger、WebSocket 实时进度、无前端构建步骤的响应式 Web UI。
 - **自动化备份**：APScheduler Cron 调度、手动全量、增量链、取消、保留策略与周期巡检。
-- **本地与云端存储**：统一 BlobStore 抽象，支持本地目录、AWS S3、MinIO 及常见 S3 兼容服务。
+- **本地与远端存储**：统一 BlobStore 抽象，支持本地目录、AWS S3、MinIO、常见 S3 兼容服务，以及使用密码或 SSH 私钥认证的 SFTP 服务器。
 - **高效选择性恢复**：约 256 MiB 多分卷、文件级选择、`skip / overwrite / rename` 覆盖策略与安全路径校验。
 - **大文件差分**：`xdelta3 + zstd`、Base-relative 单步恢复、补丁收益评估、生成后反向应用与 SHA-256 验证。
 - **可靠性与安全边界**：SQLite WAL、客户端 SHA-256 与块 CRC32、Commit 最后发布、启动对账、本地锁、远端租约、Keyring 优先的凭据存储。
@@ -36,6 +36,7 @@ EasyBackup 通过 Web 控制台管理本地目录到本地仓库或 S3 兼容对
 ### 环境要求
 
 - Python 3.10 或更高版本。
+- SFTP 支持由项目的核心依赖 `Paramiko>=4,<6` 提供，执行 `pip install -e .` 时会一并安装。
 - 普通备份不依赖外部 `tar`：归档由 Python 标准库生成。
 - `zstd` 为推荐压缩工具；`compression=auto` 在缺少它时自动使用 `gzip`。
 - 大文件差分需要 `xdelta3` 和 `zstd`。创建差分时缺少工具会安全回退完整分卷；恢复已有差分时必须具备这两个工具。
@@ -81,11 +82,12 @@ python -m venv .venv
 
 首次启动后，建议按以下顺序完成闭环：
 
-1. S3 目标先在“凭据”中创建 Profile；本地目标可跳过。
-2. 创建任务并设置源目录、存储目标、Cron、排除规则、分卷与差分参数。
-3. 使用“测试连接”验证目标可写、可读取、可查询元数据并可删除。
-4. 先运行一次全量备份，再检查快照 Manifest 与文件版本。
-5. 对测试目录执行选择性恢复，并运行抽样或深度巡检。
+1. S3 或 SFTP 目标先在“凭据”中创建对应协议的 Profile；SFTP 可选择“密码”或“SSH 私钥 + 可选 Passphrase”，本地目标可跳过。
+2. SFTP 首次连接时，使用管理员提供的 OpenSSH `SHA256:...` 主机密钥指纹，或准备可信的 `known_hosts` 文件；不要把检测页展示的未受信指纹直接视为可信。
+3. 创建任务并设置源目录、存储目标、Cron、排除规则、分卷与差分参数。
+4. 使用“测试连接”验证目标可写、可读取、可查询元数据并可删除。SFTP 还会验证排他创建、原子重命名、并发会话与可续期租约。
+5. 先运行一次全量备份，再检查快照 Manifest 与文件版本。
+6. 对测试目录执行选择性恢复，并运行抽样或深度巡检。
 
 ### CLI
 
@@ -109,13 +111,13 @@ GitHub 不会原生渲染 `.puml`，因此仓库同时提交 PlantUML 源文件�
 
 [![EasyBackup 系统上下文与部署边界](docs/architecture.svg)](docs/architecture.puml)
 
-展示操作者、源目录、EasyBackup 主机、本地数据、操作系统 Keyring，以及本地/S3 备份仓库之间的信任与部署边界。
+展示操作者、源目录、EasyBackup 主机、本地数据、操作系统 Keyring，以及本地、S3 与 SFTP/SSH 备份仓库之间的信任与部署边界。
 
 ### 静态架构 2：应用内部组件
 
 [![EasyBackup 应用内部组件](docs/component-architecture.svg)](docs/component-architecture.puml)
 
-展示安全中间件、FastAPI 控制平面、OperationManager、工作线程中的三个 Engine、启动/周期对账，以及数据库、锁、凭据和 BlobStore 适配器。
+展示安全中间件、FastAPI 控制平面、OperationManager、工作线程中的三个 Engine、启动/周期对账，以及数据库、锁、凭据和 Local/S3/SFTP BlobStore 适配器。
 
 ### 静态架构 3：SQLite 数据模型
 
@@ -127,7 +129,7 @@ GitHub 不会原生渲染 `.puml`，因此仓库同时提交 PlantUML 源文件�
 
 [![EasyBackup 本地目录与对象布局](docs/storage-layout.svg)](docs/storage-layout.puml)
 
-展示运行数据目录、远端对象键、Manifest 对完整分卷/Base/Patch 的引用，以及 Commit 最后发布的可见性边界。
+展示运行数据目录、Local/S3/SFTP 共用的逻辑对象键、SFTP 租约 CAS guard、Manifest 对完整分卷/Base/Patch 的引用，以及 Commit 最后发布的可见性边界。
 
 ### 动态架构 1：备份流程
 
@@ -180,6 +182,7 @@ GitHub 不会原生渲染 `.puml`，因此仓库同时提交 PlantUML 源文件�
 ```text
 v1/tasks/{task_id}/
 ├── write.lock.json
+├── write.lock.json.cas.guard  # 仅在 SFTP 租约变更期间短暂存在
 └── chains/{chain_id}/snapshots/{snapshot_id}/
     ├── volumes/*.tar.zst
     ├── patches/*.vcdiff.zst
@@ -212,6 +215,41 @@ v1/tasks/{task_id}/
 
 `.env.example` 仅作为配置参考；项目不会自动读取 `.env`。请通过 PowerShell、Shell、容器或服务管理器注入变量。
 
+### SFTP 存储目标
+
+SFTP 任务只在 SQLite 中保存连接参数与凭据 Profile 名称，用户名、密码、私钥和私钥 Passphrase 均由 CredentialStore 管理。以下 JSON 与任务 API 中的 `storage` 字段一致；Web UI 会生成同样的配置：
+
+```json
+{
+  "kind": "sftp",
+  "host": "backup.example.com",
+  "port": 22,
+  "base_path": "easybackup",
+  "credential_profile": "sftp-production",
+  "host_key_fingerprint": "SHA256:REPLACE_WITH_VERIFIED_SERVER_FINGERPRINT",
+  "known_hosts_path": null,
+  "connect_timeout_seconds": 15
+}
+```
+
+- `base_path` 默认为登录目录下的 `easybackup`；也可以填写服务器允许访问的绝对 POSIX 路径。
+- `host_key_fingerprint` 与 `known_hosts_path` 二选一。两者都留空时使用运行 EasyBackup 的账号所能读取的系统 `known_hosts`，未知主机密钥会被拒绝。
+- 指纹必须通过服务器管理员、控制台或其他可信通道核对。检测失败时展示的 observed fingerprint 只是辅助核对信息，不构成自动信任。
+- 凭据 Profile 必须是 SFTP 类型，并包含用户名及密码，或用户名、完整 SSH 私钥与可选 Passphrase。EasyBackup 不会自动搜索 `~/.ssh` 私钥，也不会使用 SSH Agent，以保证计划任务的认证来源确定。
+
+#### SFTP 服务器能力要求
+
+EasyBackup 不只测试“能否登录”。正式使用前，服务器还必须满足：
+
+| 能力 | 用途 |
+| --- | --- |
+| SFTP `OPEN_EXCL` 排他创建 | 串行化租约 CAS guard，阻止多个写入者同时取得所有权 |
+| `posix-rename@openssh.com` 原子覆盖 | 将同目录 `.part` 文件原子发布为最终对象，避免暴露半写入备份 |
+| 至少两个并发 SSH/SFTP 会话 | 大文件传输期间让独立租约心跳继续续期 |
+| 创建、读取、列举、重命名和删除权限 | 支持备份、恢复、巡检、保留策略与失败清理 |
+
+配置页的“测试连接”会实际验证这些语义；缺少任一安全能力时会拒绝通过，不能通过关闭检查绕过。OpenSSH SFTP 通常提供所需扩展，其他服务器应以实际探针结果为准。
+
 ### 任务默认值
 
 | 参数 | 默认值 | 含义 |
@@ -231,8 +269,9 @@ v1/tasks/{task_id}/
 
 - **完整性**：客户端计算压缩对象 SHA-256，并以块 CRC32 支持抽样巡检；不把 S3 ETag 当作完整性证明。
 - **恢复安全**：校验 Commit、Manifest、对象和最终文件；拒绝绝对路径、`..`、越界链接与平台非法路径，使用同目录临时文件原子发布。
-- **并发控制**：每任务本地文件锁配合远端带 TTL 的租约，降低重复执行和多实例写入冲突。
-- **凭据保护**：`auto` 优先操作系统 Keyring，失败时回退机器绑定 AES-256-GCM 文件；S3 密钥不写入任务表或日志。
+- **并发控制**：每任务本地文件锁配合远端带 TTL 的租约，降低重复执行和多实例写入冲突。SFTP 通过 `OPEN_EXCL` guard 串行化租约更新，并通过 POSIX rename 原子发布对象。
+- **凭据保护**：`auto` 优先操作系统 Keyring，失败时回退机器绑定 AES-256-GCM 文件；S3 密钥以及 SFTP 密码、私钥和 Passphrase 均不写入任务表、快照或日志。
+- **SSH 主机身份**：SFTP 使用经过核对的 SHA-256 指纹、指定 `known_hosts` 或系统 `known_hosts`；未知或不匹配的主机密钥会 fail-closed，不使用 TOFU 自动接受。
 - **网络边界**：默认仅监听 loopback。绑定非本机地址必须设置 API Token，并应配置可信 TLS 反向代理、来源限制和正式身份认证。
 - **可运维性**：SQLite WAL、结构化操作状态、WebSocket 进度、取消、抽样/深度巡检、完整链保留与启动对账。
 
@@ -240,6 +279,8 @@ v1/tasks/{task_id}/
 
 - EasyBackup 不是 VSS、LVM、ZFS 或应用原生快照；持续写入的数据库和业务文件不保证应用一致性。
 - 一个远端任务前缀应由一个权威 SQLite/写入主机管理；远端租约不是严格的 fencing-token 协议。
+- SFTP 客户端若在租约更新的极短临界区崩溃，可能遗留 `write.lock.json.cas.guard`。EasyBackup 会 fail-closed，绝不会按 mtime 自动删除它；管理员必须先确认所有 EasyBackup 实例均已停止，再手动删除诊断中给出的精确 guard 路径并重新运行“测试连接”。
+- 不支持 SFTP `OPEN_EXCL`、`posix-rename@openssh.com` 或至少两个并发会话的服务器，不能作为安全的 SFTP 存储目标。
 - 已有差分版本的恢复必须具备 `xdelta3` 和 `zstd`，且差分生成/恢复需要临时磁盘空间。
 - 备份负载当前是压缩而非客户端侧加密；敏感数据应使用私有 Bucket、TLS、SSE-S3/SSE-KMS 或额外加密层。
 - 机器绑定凭据降级方案不能抵御本机管理员或同等级攻击者，生产环境应优先使用操作系统 Keyring。
@@ -259,7 +300,7 @@ easyBackup/
 ├── src/easybackup/
 │   ├── app.py              # FastAPI、REST、WebSocket 与生命周期
 │   ├── engine/             # 备份、恢复、巡检与保留
-│   ├── storage/            # 本地与 S3 BlobStore
+│   ├── storage/            # 本地、S3 与 SFTP BlobStore
 │   ├── static/             # Web UI
 │   ├── db.py               # SQLite Schema 与仓储
 │   ├── scanner.py          # 文件扫描与变化识别

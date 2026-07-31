@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -117,8 +119,94 @@ class S3StorageConfig(StrictModel):
         return normalize_s3_endpoint_url(value)
 
 
+class SFTPStorageConfig(StrictModel):
+    kind: Literal["sftp"] = "sftp"
+    host: str = Field(min_length=1, max_length=253)
+    port: int = Field(default=22, ge=1, le=65535)
+    base_path: str = Field(default="easybackup", max_length=4096)
+    credential_profile: str = "default"
+    host_key_fingerprint: str | None = None
+    known_hosts_path: str | None = None
+    connect_timeout_seconds: int = Field(default=15, ge=1, le=120)
+
+    @field_validator("host", mode="before")
+    @classmethod
+    def normalize_host(cls, value: object) -> str:
+        host = str(value).strip()
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        if (
+            not host
+            or "\x00" in host
+            or any(character.isspace() for character in host)
+            or "://" in host
+            or any(character in host for character in "/\\@")
+        ):
+            raise ValueError("SFTP Host 只能填写主机名或 IP 地址。")
+        return host.lower()
+
+    @field_validator("base_path", mode="before")
+    @classmethod
+    def normalize_base_path(cls, value: object) -> str:
+        raw = str(value).strip()
+        if not raw or "\x00" in raw or "\\" in raw:
+            raise ValueError("SFTP 远端根目录必须使用 POSIX 路径。")
+        path = PurePosixPath(raw)
+        parts = path.parts[1:] if path.is_absolute() else path.parts
+        if (
+            (not path.is_absolute() and not parts)
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ValueError("SFTP 远端根目录包含不安全路径片段。")
+        return path.as_posix()
+
+    @field_validator("credential_profile", mode="before")
+    @classmethod
+    def normalize_credential_profile(cls, value: object) -> str:
+        profile = str(value).strip()
+        if not profile:
+            raise ValueError("SFTP 凭据配置名称不能为空。")
+        return profile
+
+    @field_validator("known_hosts_path", mode="before")
+    @classmethod
+    def normalize_optional_text(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        stripped = str(value).strip()
+        if "\x00" in stripped:
+            raise ValueError("known_hosts 路径不能包含 NUL 字符。")
+        return stripped or None
+
+    @field_validator("host_key_fingerprint", mode="before")
+    @classmethod
+    def normalize_host_key_fingerprint(
+        cls, value: object
+    ) -> str | None:
+        if value is None:
+            return None
+        fingerprint = str(value).strip()
+        if not fingerprint:
+            return None
+        if fingerprint.lower().startswith("sha256:"):
+            fingerprint = f"SHA256:{fingerprint.split(':', 1)[1]}"
+        if not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}=?", fingerprint):
+            raise ValueError(
+                "主机密钥指纹必须是 OpenSSH SHA256:... 格式。"
+            )
+        return fingerprint.rstrip("=")
+
+    @model_validator(mode="after")
+    def choose_host_key_source(self) -> "SFTPStorageConfig":
+        if self.host_key_fingerprint and self.known_hosts_path:
+            raise ValueError(
+                "主机密钥指纹与 known_hosts 路径只能选择一种。"
+            )
+        return self
+
+
 StorageConfig = Annotated[
-    LocalStorageConfig | S3StorageConfig,
+    LocalStorageConfig | S3StorageConfig | SFTPStorageConfig,
     Field(discriminator="kind"),
 ]
 
@@ -473,16 +561,31 @@ class ScrubRequest(StrictModel):
 
 
 class CredentialWrite(StrictModel):
+    kind: Literal["s3", "sftp"] = "s3"
     profile: str = Field(min_length=1, max_length=120)
-    access_key_id: str = Field(min_length=1)
-    secret_access_key: str = Field(min_length=1)
+    access_key_id: str | None = Field(default=None, min_length=1)
+    secret_access_key: str | None = Field(
+        default=None,
+        min_length=1,
+        repr=False,
+    )
     session_token: str | None = None
+    username: str | None = Field(default=None, min_length=1)
+    auth_method: Literal["password", "private_key"] | None = None
+    password: str | None = Field(default=None, min_length=1, repr=False)
+    private_key: str | None = Field(default=None, min_length=1, repr=False)
+    private_key_passphrase: str | None = Field(
+        default=None,
+        min_length=1,
+        repr=False,
+    )
 
     @field_validator(
         "profile",
         "access_key_id",
         "secret_access_key",
         "session_token",
+        "username",
         mode="before",
     )
     @classmethod
@@ -492,6 +595,57 @@ class CredentialWrite(StrictModel):
             return stripped or None
         return value
 
+    @field_validator("private_key", mode="before")
+    @classmethod
+    def normalize_private_key(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.replace("\r\n", "\n").strip()
+            return f"{normalized}\n" if normalized else None
+        return value
+
+    @model_validator(mode="after")
+    def validate_credential_kind(self) -> "CredentialWrite":
+        if self.kind == "s3":
+            if not self.access_key_id or not self.secret_access_key:
+                raise ValueError("S3 凭据必须包含 Access Key ID 与 Secret。")
+            if any(
+                value is not None
+                for value in (
+                    self.username,
+                    self.auth_method,
+                    self.password,
+                    self.private_key,
+                    self.private_key_passphrase,
+                )
+            ):
+                raise ValueError("S3 凭据不能混入 SFTP 认证字段。")
+            return self
+
+        if not self.username:
+            raise ValueError("SFTP 凭据必须包含用户名。")
+        if self.auth_method == "password":
+            if not self.password:
+                raise ValueError("SFTP 密码认证必须填写密码。")
+            if self.private_key or self.private_key_passphrase:
+                raise ValueError("密码认证不能混入私钥字段。")
+        elif self.auth_method == "private_key":
+            if not self.private_key:
+                raise ValueError("SFTP 私钥认证必须填写私钥。")
+            if self.password:
+                raise ValueError("私钥认证不能混入登录密码。")
+        else:
+            raise ValueError("SFTP 凭据必须选择认证方式。")
+        if any(
+            value is not None
+            for value in (
+                self.access_key_id,
+                self.secret_access_key,
+                self.session_token,
+            )
+        ):
+            raise ValueError("SFTP 凭据不能混入 S3 访问密钥字段。")
+        return self
+
 
 class ApiSessionRequest(StrictModel):
     token: str = Field(min_length=1)
@@ -500,8 +654,13 @@ class ApiSessionRequest(StrictModel):
 class CredentialStatus(StrictModel):
     profile: str
     backend: str
-    access_key_hint: str
-    has_session_token: bool
+    kind: Literal["s3", "sftp"] = "s3"
+    access_key_hint: str | None = None
+    identity_hint: str | None = None
+    auth_method: Literal["password", "private_key"] | None = None
+    has_session_token: bool = False
+    has_password: bool = False
+    has_private_key: bool = False
     updated_at: str
 
 

@@ -22,7 +22,7 @@ const SCHEDULE_PRESETS = {
 };
 const STORAGE_PROBE_IDLE_MESSAGE = "保存任务前，可验证写入、读取与删除权限。";
 const STORAGE_CONFIG_FIELD_SELECTOR =
-  'input[name="storage_kind"], input[name^="storage."]';
+  '[name="storage_kind"], [name^="storage."]';
 const STORAGE_DIAGNOSTIC_FACTS = [
   ["kind", "诊断类型"],
   ["problem_code", "问题代码"],
@@ -32,6 +32,15 @@ const STORAGE_DIAGNOSTIC_FACTS = [
   ["endpoint", "Endpoint"],
   ["bucket", "Bucket"],
   ["region", "Region"],
+  ["host", "SFTP 主机"],
+  ["port", "SSH 端口"],
+  ["base_path", "远端根目录"],
+  ["auth_method", "认证方式"],
+  ["host_key_verification", "主机密钥验证"],
+  ["host_key_fingerprint", "已配置指纹"],
+  ["expected_host_key_fingerprint", "期望指纹"],
+  ["observed_host_key_fingerprint", "服务端指纹"],
+  ["guard_key", "租约保护文件"],
   ["operation", "失败操作"],
 ];
 const VIEW_META = {
@@ -58,7 +67,7 @@ const VIEW_META = {
   credentials: {
     eyebrow: "SECURE VAULT",
     title: "存储与密钥",
-    subtitle: "通过系统 Keyring 安全管理对象存储访问密钥。",
+    subtitle: "通过系统 Keyring 安全管理 S3 与 SFTP 访问凭据。",
   },
   system: {
     eyebrow: "DIAGNOSTICS",
@@ -453,8 +462,11 @@ function closeDialog(dialogId) {
   else dialog.removeAttribute("open");
   if (dialogId === "credentialDialog") {
     $("#credentialForm").reset();
-    $("#credentialSecretKey").type = "password";
-    $("#toggleSecretButton").textContent = "显示";
+    resetCredentialSecretControls();
+    $$(`input[name="credential_kind"]`).forEach((radio) => {
+      radio.disabled = false;
+    });
+    toggleCredentialFields("s3");
   }
 }
 
@@ -470,7 +482,7 @@ function setFieldError(form, path, message) {
   const candidates = [
     path,
     path.replace(/^task\./, ""),
-    path.replace(/^storage\.(?:s3|local)\./, "storage."),
+    path.replace(/^storage\.(?:s3|sftp|local)\./, "storage."),
     path.replace(/^storage\./, "storage."),
     path.split(".").slice(-1)[0],
   ];
@@ -689,13 +701,31 @@ function lastOperationForTask(taskId) {
     .sort((a, b) => new Date(b.created_at ?? 0) - new Date(a.created_at ?? 0))[0];
 }
 
+function storageKindLabel(kind) {
+  return {
+    local: "本地",
+    s3: "S3 / OSS",
+    sftp: "SFTP",
+  }[kind] ?? "未知";
+}
+
 function taskTargetLabel(task) {
   const storage = task.storage ?? {};
   if (storage.kind === "s3") {
     const prefix = storage.prefix ? `/${storage.prefix}` : "";
     return `s3://${storage.bucket ?? "—"}${prefix}`;
   }
-  return storage.path ?? "未配置目标";
+  if (storage.kind === "sftp") {
+    const rawHost = String(storage.host ?? "—");
+    const host = rawHost.includes(":") && !rawHost.startsWith("[")
+      ? `[${rawHost}]`
+      : rawHost;
+    const port = numberOr(storage.port, 22);
+    const basePath = String(storage.base_path ?? "easybackup").replace(/^\/+/, "");
+    return `sftp://${host}:${port}/${basePath}`;
+  }
+  if (storage.kind === "local") return storage.path ?? "未配置目标";
+  return `不支持的存储类型：${storage.kind ?? "未知"}`;
 }
 
 function taskScheduleLabel(task) {
@@ -778,15 +808,114 @@ function fallbackStorageDiagnostic(error, storage) {
   const signal = `${diagnosticKind} ${problemCode} ${providerCode} ${error?.message ?? ""}`
     .toLowerCase()
     .replace(/[\s_-]+/g, "");
+  const isSftp = storage?.kind === "sftp";
   let title = "无法验证存储配置";
   let summary = error?.message || "存储服务未返回可识别的诊断信息。";
-  let suggestions = [
-    "核对存储类型、Endpoint、Bucket、Region 与凭据配置后重新检测。",
-    "展开下方“常见配置错误”，按网络、权限和签名顺序排查。",
-    "如仍失败，请保留服务商错误码和请求 ID，以便进一步定位。",
-  ];
+  let suggestions = isSftp
+    ? [
+        "核对 SFTP 主机、端口、远端根目录与 SFTP 凭据配置后重新检测。",
+        "确认主机密钥已经线下核验，并检查 SSH 网络、认证方式和目录权限。",
+        "如仍失败，请保留诊断类型与服务端指纹，以便服务器管理员定位。",
+      ]
+    : [
+        "核对存储类型、Endpoint、Bucket、Region 与凭据配置后重新检测。",
+        "展开下方“常见配置错误”，按网络、权限和签名顺序排查。",
+        "如仍失败，请保留服务商错误码和请求 ID，以便进一步定位。",
+      ];
 
-  if (signal.includes("publicendpointforbidden")) {
+  if (
+    isSftp &&
+    (
+      signal.includes("hostkeyuntrusted") ||
+      signal.includes("unknownhostkey") ||
+      signal.includes("hostkeyunknown") ||
+      signal.includes("hostkeymismatch") ||
+      signal.includes("badhostkey") ||
+      signal.includes("hostkeynotverifiable")
+    )
+  ) {
+    const mismatch =
+      signal.includes("mismatch") || signal.includes("badhostkey");
+    title = mismatch ? "SFTP 主机密钥与已信任指纹不一致" : "SFTP 主机密钥尚未信任";
+    summary = mismatch
+      ? "服务器返回的 SSH 主机密钥与配置中的指纹或 known_hosts 记录不同；这可能是服务器换钥，也可能表示连接遭到拦截。"
+      : "服务器身份尚未通过已核验的 SSH 主机密钥确认，连接已被安全地拒绝。";
+    suggestions = [
+      "不要绕过主机密钥检查；先通过服务器控制台或管理员线下核验 SHA256 指纹。",
+      "核验一致后，将 OpenSSH SHA256 指纹填入任务，或更新运行 EasyBackup 主机上的 known_hosts。",
+      "若指纹意外变化，请先排查服务器重装、DNS 劫持或中间人攻击，再决定是否更新。",
+    ];
+  } else if (
+    isSftp &&
+    (
+      diagnosticKind === "authentication" ||
+      signal.includes("authenticationfailed") ||
+      signal.includes("authfailed") ||
+      signal.includes("badauthenticationtype") ||
+      signal.includes("invalidprivatekey") ||
+      signal.includes("privatekey") ||
+      signal.includes("passphrase")
+    )
+  ) {
+    title = "SFTP 身份验证失败";
+    summary = "SSH 服务器拒绝了当前用户名和认证材料，或私钥格式、私钥口令与服务器要求不匹配。";
+    suggestions = [
+      "确认所选凭据是 SFTP 类型，用户名正确，且没有误选同名的 S3 凭据。",
+      "密码认证请核对原始密码；密码前后空格会被保留，不要额外添加或删除。",
+      "私钥认证请粘贴完整 OpenSSH/PEM 私钥；加密私钥还需填写正确的 Private Key Passphrase。",
+    ];
+  } else if (
+    isSftp &&
+    (
+      diagnosticKind === "ssh_negotiation" ||
+      signal.includes("sshnegotiation") ||
+      signal.includes("incompatiblepeer") ||
+      signal.includes("nomatchingkex") ||
+      signal.includes("nomatchingcipher") ||
+      signal.includes("keyexchangefailed")
+    )
+  ) {
+    title = "SSH 加密算法协商失败";
+    summary = "客户端与服务器无法就主机密钥、密钥交换或加密算法达成一致。";
+    suggestions = [
+      "检查服务器 SSH 日志，确认允许现代 host-key、KEX 与 cipher 算法。",
+      "升级远端 SSH 服务，避免重新启用已淘汰的弱算法。",
+      "若服务器由第三方管理，请将诊断信息交给管理员核对兼容策略。",
+    ];
+  } else if (
+    isSftp &&
+    (
+      diagnosticKind === "remote_path" ||
+      signal.includes("remotepath") ||
+      signal.includes("nosuchfile") ||
+      signal.includes("notadirectory")
+    )
+  ) {
+    title = "SFTP 远端目录不存在或不可用";
+    summary = "服务器可以连接，但无法进入或创建配置的远端根目录。";
+    suggestions = [
+      "远端根目录相对于 SFTP 登录目录；通常填写 easybackup，而不是本机文件系统路径。",
+      "确认父目录存在，并允许当前 SFTP 用户创建目录、列出内容和重命名文件。",
+      "若账号被 chroot，请使用该受限根目录内可见的路径。",
+    ];
+  } else if (
+    isSftp &&
+    (
+      diagnosticKind === "quota" ||
+      signal.includes("quota") ||
+      signal.includes("nospace") ||
+      signal.includes("enospc") ||
+      signal.includes("diskfull")
+    )
+  ) {
+    title = "SFTP 服务器空间或配额不足";
+    summary = "远端服务器无法继续写入探针文件，通常是磁盘空间、用户配额或 inode 已耗尽。";
+    suggestions = [
+      "检查远端文件系统剩余空间、inode 和当前 SFTP 用户的磁盘配额。",
+      "清理无用文件或扩容后，再重新执行连接检测。",
+      "确认远端根目录没有落在只读挂载点。",
+    ];
+  } else if (signal.includes("publicendpointforbidden")) {
     title = "当前环境禁止使用公网 Endpoint";
     summary = "对象存储拒绝了公网服务地址，通常与 Bucket、账号或运行环境的网络访问策略有关。";
     suggestions = [
@@ -809,6 +938,9 @@ function fallbackStorageDiagnostic(error, storage) {
   } else if (
     signal.includes("endpointconnection") ||
     signal.includes("endpointunreachable") ||
+    signal.includes("connectionrefused") ||
+    signal.includes("connectionreset") ||
+    signal.includes("networkunreachable") ||
     signal.includes("timeout") ||
     signal.includes("timedout") ||
     signal.includes("dns") ||
@@ -818,13 +950,21 @@ function fallbackStorageDiagnostic(error, storage) {
     signal.includes("tls") ||
     signal.includes("certificate")
   ) {
-    title = "无法建立 DNS / TLS 连接";
-    summary = "主机无法解析或安全连接到 Endpoint，请先检查网络路径、代理和证书。";
-    suggestions = [
-      "确认运行 EasyBackup 的主机能够解析 Endpoint 域名并访问 443 端口。",
-      "检查防火墙、系统代理、企业 TLS 检查和自签名证书设置。",
-      "若使用内网 Endpoint，请确认当前主机位于对应 VPC 或已配置专线 / VPN。",
-    ];
+    title = isSftp ? "无法建立 DNS / SSH 连接" : "无法建立 DNS / TLS 连接";
+    summary = isSftp
+      ? "主机无法解析 SFTP 服务器，或无法在配置端口建立 SSH 连接。"
+      : "主机无法解析或安全连接到 Endpoint，请先检查网络路径、代理和证书。";
+    suggestions = isSftp
+      ? [
+          `确认运行 EasyBackup 的主机能够解析 SFTP 主机并访问 ${storage?.port ?? 22} 端口。`,
+          "检查客户端与服务器防火墙、安全组、VPN、端口转发和 SSH 服务状态。",
+          "若连接被拒绝，请在服务器端确认 sshd/SFTP 子系统已启动并监听正确地址。",
+        ]
+      : [
+          "确认运行 EasyBackup 的主机能够解析 Endpoint 域名并访问 443 端口。",
+          "检查防火墙、系统代理、企业 TLS 检查和自签名证书设置。",
+          "若使用内网 Endpoint，请确认当前主机位于对应 VPC 或已配置专线 / VPN。",
+        ];
   } else if (
     diagnosticKind === "bucket" ||
     signal.includes("nosuchbucket") ||
@@ -858,6 +998,22 @@ function fallbackStorageDiagnostic(error, storage) {
       "确认 Region 和 Endpoint 与服务商的 S3 兼容签名要求一致。",
     ];
   } else if (
+    isSftp &&
+    (
+      diagnosticKind === "permission" ||
+      signal.includes("permissiondenied") ||
+      signal.includes("accessdenied") ||
+      signal.includes("readonlyfilesystem")
+    )
+  ) {
+    title = "SFTP 远端目录权限不足";
+    summary = "SSH 登录成功，但当前账号无法完成探针所需的创建、写入、读取、重命名或删除操作。";
+    suggestions = [
+      "为 SFTP 用户授予远端根目录及其父目录所需的遍历、创建、读取、写入、重命名和删除权限。",
+      "检查 ACL、chroot、只读挂载、SELinux/AppArmor 与服务器端 SFTP 限制。",
+      "使用同一账号在服务器端手动创建并删除测试文件，确认权限链完整。",
+    ];
+  } else if (
     signal.includes("invalidaccesskey") ||
     signal.includes("credentialprofile") ||
     signal.includes("credential") ||
@@ -867,12 +1023,20 @@ function fallbackStorageDiagnostic(error, storage) {
     signal.includes("forbidden")
   ) {
     title = "凭据不存在或权限不足";
-    summary = "当前凭据无法完成探针所需的写入、读取元数据、读取和删除操作。";
-    suggestions = [
-      "确认任务引用的凭据配置名称正确，且 AK/SK 仍然有效。",
-      "授予该凭据对目标 Bucket 和对象前缀的写入、读取与删除权限。",
-      "若使用临时凭据，请同时填写有效的 Session Token 并检查过期时间。",
-    ];
+    summary = isSftp
+      ? "当前 SFTP 凭据不存在、类型不匹配，或无法完成远端文件操作。"
+      : "当前凭据无法完成探针所需的写入、读取元数据、读取和删除操作。";
+    suggestions = isSftp
+      ? [
+          "确认任务引用的凭据配置存在且类型为 SFTP，配置名称区分大小写。",
+          "核对用户名、认证方式以及对应的密码或 SSH 私钥。",
+          "确认账号对远端根目录具有列出、创建、读取、写入、重命名和删除权限。",
+        ]
+      : [
+          "确认任务引用的凭据配置名称正确，且 AK/SK 仍然有效。",
+          "授予该凭据对目标 Bucket 和对象前缀的写入、读取与删除权限。",
+          "若使用临时凭据，请同时填写有效的 Session Token 并检查过期时间。",
+        ];
   } else if (
     signal.includes("unsupportedoperation") ||
     signal.includes("addressingstyle")
@@ -910,6 +1074,11 @@ function fallbackStorageDiagnostic(error, storage) {
     endpoint: storage?.kind === "s3" ? storage.endpoint_url : null,
     bucket: storage?.kind === "s3" ? storage.bucket : null,
     region: storage?.kind === "s3" ? storage.region : null,
+    host: storage?.kind === "sftp" ? storage.host : null,
+    port: storage?.kind === "sftp" ? storage.port : null,
+    base_path: storage?.kind === "sftp" ? storage.base_path : null,
+    host_key_fingerprint:
+      storage?.kind === "sftp" ? storage.host_key_fingerprint : null,
   };
 }
 
@@ -935,6 +1104,25 @@ function storageDiagnosticFromError(error, storage) {
     endpoint: supplied.endpoint ?? fallback.endpoint,
     bucket: supplied.bucket ?? fallback.bucket,
     region: supplied.region ?? fallback.region,
+    host: supplied.host ?? fallback.host,
+    port: supplied.port ?? fallback.port,
+    base_path:
+      supplied.base_path ?? supplied.remote_path ?? fallback.base_path,
+    auth_method: supplied.auth_method ?? fallback.auth_method,
+    host_key_fingerprint:
+      supplied.host_key_fingerprint ?? fallback.host_key_fingerprint,
+    host_key_verification:
+      supplied.host_key_verification ?? fallback.host_key_verification,
+    expected_host_key_fingerprint:
+      supplied.expected_host_key_fingerprint ??
+      supplied.expected_fingerprint ??
+      fallback.expected_host_key_fingerprint,
+    observed_host_key_fingerprint:
+      supplied.observed_host_key_fingerprint ??
+      supplied.observed_fingerprint ??
+      supplied.server_fingerprint ??
+      fallback.observed_host_key_fingerprint,
+    guard_key: supplied.guard_key ?? fallback.guard_key,
     operation: supplied.operation ?? fallback.operation,
   };
 }
@@ -987,7 +1175,7 @@ function invalidateStorageProbe() {
 function renderSidebarOverview() {
   const enabledTasks = state.tasks.filter((task) => task.enabled);
   const targetKinds = new Set(
-    enabledTasks.map((task) => (task.storage?.kind === "s3" ? "S3 / OSS" : "本地")),
+    enabledTasks.map((task) => storageKindLabel(task.storage?.kind)),
   );
   const scheduler = state.system?.scheduler;
   const schedulerRunning =
@@ -1033,8 +1221,14 @@ function renderTaskCard(task) {
   const card = element("article", `task-card${task.enabled ? "" : " is-disabled"}`);
   const head = element("div", "task-card-head");
   const title = element("div", "task-card-title");
-  const storageKind = task.storage?.kind === "s3" ? "s3" : "local";
-  const kindMark = element("span", `task-kind-mark ${storageKind}`, storageKind === "s3" ? "☁" : "▰");
+  const storageKind = ["local", "s3", "sftp"].includes(task.storage?.kind)
+    ? task.storage.kind
+    : "unknown";
+  const kindMark = element(
+    "span",
+    `task-kind-mark ${storageKind}`,
+    { local: "▰", s3: "☁", sftp: "⇄", unknown: "?" }[storageKind],
+  );
   const titleCopy = element("div");
   append(titleCopy, element("h2", "", task.name), element("p", "", task.source_path));
   append(title, kindMark, titleCopy);
@@ -1206,12 +1400,15 @@ function populateTaskOptions() {
     select.value = "";
   }
 
-  const datalist = $("#credentialProfileOptions");
-  clear(datalist);
+  const s3Datalist = $("#s3CredentialProfileOptions");
+  const sftpDatalist = $("#sftpCredentialProfileOptions");
+  clear(s3Datalist);
+  clear(sftpDatalist);
   for (const credential of state.credentials) {
     const option = element("option");
     option.value = credential.profile;
-    datalist.append(option);
+    const kind = credential.kind === "sftp" ? "sftp" : "s3";
+    (kind === "sftp" ? sftpDatalist : s3Datalist).append(option);
   }
 }
 
@@ -1252,6 +1449,10 @@ function resetTaskForm() {
   $("#s3Prefix").value = "easybackup";
   $("#s3CredentialProfile").value = "default";
   $("#s3ChunkSize").value = "16";
+  $("#sftpPort").value = "22";
+  $("#sftpBasePath").value = "easybackup";
+  $("#sftpCredentialProfile").value = "default";
+  $("#sftpConnectTimeout").value = "15";
   toggleStorageFields("local");
   toggleDeltaFields(true);
   applySchedulePreset("manual");
@@ -1259,9 +1460,9 @@ function resetTaskForm() {
 }
 
 function toggleStorageFields(kind) {
-  const isS3 = kind === "s3";
-  $("#localStorageFields").classList.toggle("is-hidden", isS3);
-  $("#s3StorageFields").classList.toggle("is-hidden", !isS3);
+  $("#localStorageFields").classList.toggle("is-hidden", kind !== "local");
+  $("#s3StorageFields").classList.toggle("is-hidden", kind !== "s3");
+  $("#sftpStorageFields").classList.toggle("is-hidden", kind !== "sftp");
 }
 
 function toggleDeltaFields(enabled) {
@@ -1300,12 +1501,21 @@ function openTaskForm(taskId = "") {
     toggleDeltaFields($("#taskDeltaEnabled").checked);
     $("#taskExcludes").value = Array.isArray(task.excludes) ? task.excludes.join("\n") : "";
 
-    const kind = task.storage?.kind === "s3" ? "s3" : "local";
-    $(`input[name="storage_kind"][value="${kind}"]`).checked = true;
+    const kind = task.storage?.kind;
+    const kindRadio = $(`input[name="storage_kind"][value="${kind}"]`);
+    if (!kindRadio) {
+      showToast(
+        "无法编辑任务",
+        `任务使用了当前页面不支持的存储类型：${kind ?? "未知"}`,
+        "error",
+      );
+      return;
+    }
+    kindRadio.checked = true;
     toggleStorageFields(kind);
     if (kind === "local") {
       $("#localStoragePath").value = task.storage?.path ?? "";
-    } else {
+    } else if (kind === "s3") {
       $("#s3Bucket").value = task.storage?.bucket ?? "";
       $("#s3Prefix").value = task.storage?.prefix ?? "easybackup";
       $("#s3Region").value = task.storage?.region ?? "";
@@ -1313,6 +1523,18 @@ function openTaskForm(taskId = "") {
       $("#s3CredentialProfile").value = task.storage?.credential_profile ?? "default";
       $("#s3StorageClass").value = task.storage?.storage_class ?? "";
       $("#s3ChunkSize").value = task.storage?.multipart_chunk_mb ?? 16;
+    } else if (kind === "sftp") {
+      $("#sftpHost").value = task.storage?.host ?? "";
+      $("#sftpPort").value = task.storage?.port ?? 22;
+      $("#sftpBasePath").value = task.storage?.base_path ?? "easybackup";
+      $("#sftpCredentialProfile").value =
+        task.storage?.credential_profile ?? "default";
+      $("#sftpHostKeyFingerprint").value =
+        task.storage?.host_key_fingerprint ?? "";
+      $("#sftpKnownHostsPath").value =
+        task.storage?.known_hosts_path ?? "";
+      $("#sftpConnectTimeout").value =
+        task.storage?.connect_timeout_seconds ?? 15;
     }
   }
   openDialog("taskDialog");
@@ -1411,10 +1633,77 @@ function collectStoragePayload() {
       multipart_chunk_mb: numberOr($("#s3ChunkSize").value, 16),
     };
   }
+  if (kind === "sftp") {
+    return {
+      kind: "sftp",
+      host: $("#sftpHost").value.trim(),
+      port: numberOr($("#sftpPort").value, 22),
+      base_path: $("#sftpBasePath").value.trim() || "easybackup",
+      credential_profile:
+        $("#sftpCredentialProfile").value.trim() || "default",
+      host_key_fingerprint:
+        $("#sftpHostKeyFingerprint").value.trim() || null,
+      known_hosts_path:
+        $("#sftpKnownHostsPath").value.trim() || null,
+      connect_timeout_seconds:
+        numberOr($("#sftpConnectTimeout").value, 15),
+    };
+  }
   return {
     kind: "local",
     path: $("#localStoragePath").value.trim(),
   };
+}
+
+function validateSftpStoragePayload(storage, form) {
+  if (storage.kind !== "sftp") return [];
+  const issues = [];
+  const addIssue = (path, message) => {
+    issues.push({ path, message });
+    setFieldError(form, path, message);
+  };
+  if (!storage.host) {
+    addIssue("storage.host", "请输入 SFTP 服务器主机名或 IP 地址。");
+  } else if (
+    storage.host.includes("://") ||
+    storage.host.includes("/") ||
+    storage.host.includes("@")
+  ) {
+    addIssue("storage.host", "主机字段只填写域名或 IP，不要包含协议、用户或路径。");
+  }
+  if (!Number.isInteger(storage.port) || storage.port < 1 || storage.port > 65535) {
+    addIssue("storage.port", "SSH 端口必须是 1 到 65535 之间的整数。");
+  }
+  if (!storage.base_path) {
+    addIssue("storage.base_path", "请输入远端根目录。");
+  }
+  if (
+    !Number.isInteger(storage.connect_timeout_seconds) ||
+    storage.connect_timeout_seconds < 1 ||
+    storage.connect_timeout_seconds > 120
+  ) {
+    addIssue("storage.connect_timeout_seconds", "连接超时必须是 1 到 120 秒。");
+  }
+  if (
+    storage.host_key_fingerprint &&
+    !/^SHA256:[A-Za-z0-9+/]{43}=?$/.test(storage.host_key_fingerprint)
+  ) {
+    addIssue(
+      "storage.host_key_fingerprint",
+      "请填写 OpenSSH SHA256 指纹，例如 SHA256:AbCd…。",
+    );
+  }
+  if (storage.host_key_fingerprint && storage.known_hosts_path) {
+    addIssue(
+      "storage.host_key_fingerprint",
+      "主机密钥指纹与 known_hosts 路径只能选择一种。",
+    );
+    addIssue(
+      "storage.known_hosts_path",
+      "主机密钥指纹与 known_hosts 路径只能选择一种。",
+    );
+  }
+  return issues;
 }
 
 async function testStorageConfiguration() {
@@ -1430,6 +1719,19 @@ async function testStorageConfiguration() {
   if (storage.kind === "s3" && !storage.bucket) {
     setFieldError(form, "storage.bucket", "请先输入 Bucket 名称。");
     setStorageProbeStatus("请先补充 S3 / OSS Bucket。", "error");
+    return;
+  }
+  const sftpIssues = validateSftpStoragePayload(storage, form);
+  if (sftpIssues.length) {
+    setStorageProbeStatus(sftpIssues[0].message, "error");
+    renderStorageDiagnostic(
+      fallbackStorageDiagnostic(
+        new ApiError(sftpIssues[0].message, 0, {
+          code: "INVALID_SFTP_CONFIGURATION",
+        }),
+        storage,
+      ),
+    );
     return;
   }
   const endpointValidation =
@@ -1503,6 +1805,9 @@ function validateTaskPayload(payload) {
   }
   if (payload.storage.kind === "s3" && !payload.storage.bucket) {
     setFieldError(form, "storage.bucket", "请输入 Bucket 名称。");
+    valid = false;
+  }
+  if (validateSftpStoragePayload(payload.storage, form).length) {
     valid = false;
   }
   if (payload.delta_enabled && payload.delta_threshold_mb < 1) {
@@ -2337,12 +2642,23 @@ function renderCredentials() {
   const container = $("#credentialList");
   clear(container);
   if (!state.credentials.length) {
-    createEmptyState(container, "尚未保存凭据", "添加 S3 / OSS 访问密钥后，即可在备份任务中引用。", "添加凭据", "new-credential");
+    createEmptyState(
+      container,
+      "尚未保存凭据",
+      "添加 S3 / OSS 访问密钥或 SFTP 登录凭据后，即可在备份任务中引用。",
+      "添加凭据",
+      "new-credential",
+    );
   } else {
     for (const credential of state.credentials) {
+      const kind = credential.kind === "sftp" ? "sftp" : "s3";
       const card = element("article", "credential-card");
       const head = element("div", "credential-card-head");
-      const mark = element("span", "credential-glyph", "⌘");
+      const mark = element(
+        "span",
+        `credential-glyph ${kind}`,
+        kind === "sftp" ? "⇄" : "⌘",
+      );
       const headActions = element("div", "credential-card-actions");
       const rotateButton = element("button", "text-button", "轮换");
       rotateButton.type = "button";
@@ -2356,20 +2672,36 @@ function renderCredentials() {
       deleteButton.setAttribute("aria-label", `删除凭据 ${credential.profile}`);
       append(headActions, rotateButton, deleteButton);
       append(head, mark, headActions);
-      const tokenBadge = credential.has_session_token
-        ? statusBadge("warning", "含临时令牌")
-        : statusBadge("completed", "已安全保存");
+      const credentialBadge =
+        kind === "sftp"
+          ? statusBadge(
+              "neutral",
+              credential.auth_method === "private_key"
+                ? "SFTP · 私钥"
+                : "SFTP · 密码",
+            )
+          : credential.has_session_token
+            ? statusBadge("warning", "S3 · 临时令牌")
+            : statusBadge("completed", "S3 · 已保存");
+      const identity =
+        kind === "sftp"
+          ? credential.identity_hint ??
+            credential.username_hint ??
+            "SFTP 用户 ****"
+          : credential.identity_hint ??
+            credential.access_key_hint ??
+            "AK ****";
       const footer = element("footer");
       append(
         footer,
         element("span", "", `${credential.backend ?? "系统密钥环"} · ${formatDate(credential.updated_at)}`),
-        tokenBadge,
+        credentialBadge,
       );
       append(
         card,
         head,
         element("h2", "", credential.profile),
-        element("p", "", credential.access_key_hint || "AK ****"),
+        element("p", "", identity),
         footer,
       );
       container.append(card);
@@ -2392,35 +2724,148 @@ async function loadCredentials({ silent = false } = {}) {
   }
 }
 
+function toggleSftpAuthenticationFields(authMethod) {
+  const privateKey = authMethod === "private_key";
+  $("#sftpPasswordCredentialFields").classList.toggle("is-hidden", privateKey);
+  $("#sftpPrivateKeyCredentialFields").classList.toggle("is-hidden", !privateKey);
+  $("#credentialSftpPassword").required = !privateKey;
+  $("#credentialSftpPrivateKey").required = privateKey;
+}
+
+function toggleCredentialFields(kind) {
+  const isSftp = kind === "sftp";
+  $("#s3CredentialFields").classList.toggle("is-hidden", isSftp);
+  $("#sftpCredentialFields").classList.toggle("is-hidden", !isSftp);
+  $("#credentialAccessKey").required = !isSftp;
+  $("#credentialSecretKey").required = !isSftp;
+  $("#credentialSftpUsername").required = isSftp;
+  if (isSftp) {
+    toggleSftpAuthenticationFields($("#credentialSftpAuthMethod").value);
+  } else {
+    $("#credentialSftpPassword").required = false;
+    $("#credentialSftpPrivateKey").required = false;
+  }
+}
+
+function resetCredentialSecretControls() {
+  for (const [inputSelector, buttonSelector, label, ariaLabel] of [
+    ["#credentialSecretKey", "#toggleSecretButton", "显示", "显示密钥"],
+    [
+      "#credentialSftpPassword",
+      "#toggleSftpPasswordButton",
+      "显示",
+      "显示密码",
+    ],
+  ]) {
+    const input = $(inputSelector);
+    const button = $(buttonSelector);
+    input.type = "password";
+    button.textContent = label;
+    button.setAttribute("aria-label", ariaLabel);
+  }
+  $("#credentialSftpPassphrase").type = "password";
+  toggleSftpAuthenticationFields(
+    $("#credentialSftpAuthMethod").value || "password",
+  );
+}
+
 function openCredentialForm(profile = "") {
   const form = $("#credentialForm");
   form.reset();
   clearFormErrors(form);
-  $("#credentialSecretKey").type = "password";
-  $("#toggleSecretButton").textContent = "显示";
-  $("#credentialDialogTitle").textContent = profile ? "轮换 S3 凭据" : "添加 S3 凭据";
+  resetCredentialSecretControls();
+  const existing = state.credentials.find(
+    (credential) => credential.profile === profile,
+  );
+  const kind = existing?.kind === "sftp" ? "sftp" : "s3";
+  const kindRadio = $(`input[name="credential_kind"][value="${kind}"]`);
+  kindRadio.checked = true;
+  $$(`input[name="credential_kind"]`).forEach((radio) => {
+    radio.disabled = Boolean(profile);
+  });
+  if (kind === "sftp" && existing) {
+    $("#credentialSftpUsername").value = existing.identity_hint ?? "";
+    $("#credentialSftpAuthMethod").value =
+      existing.auth_method === "private_key"
+        ? "private_key"
+        : "password";
+  }
+  toggleCredentialFields(kind);
+  $("#credentialDialogTitle").textContent = profile
+    ? `轮换 ${kind === "sftp" ? "SFTP" : "S3"} 凭据`
+    : "添加存储凭据";
   $("#credentialProfile").value = profile;
   $("#credentialProfile").readOnly = Boolean(profile);
   openDialog("credentialDialog");
-  window.setTimeout(() => (profile ? $("#credentialAccessKey") : $("#credentialProfile")).focus(), 20);
+  window.setTimeout(
+    () =>
+      (
+        profile
+          ? kind === "sftp"
+            ? $("#credentialSftpUsername")
+            : $("#credentialAccessKey")
+          : $("#credentialProfile")
+      ).focus(),
+    20,
+  );
 }
 
 async function saveCredential(event) {
   event.preventDefault();
   const form = $("#credentialForm");
   clearFormErrors(form);
+  const kind =
+    $(`input[name="credential_kind"]:checked`)?.value === "sftp"
+      ? "sftp"
+      : "s3";
   const payload = {
+    kind,
     profile: $("#credentialProfile").value.trim(),
-    access_key_id: $("#credentialAccessKey").value.trim(),
-    secret_access_key: $("#credentialSecretKey").value,
-    session_token: $("#credentialSessionToken").value.trim() || null,
   };
+  if (kind === "s3") {
+    Object.assign(payload, {
+      access_key_id: $("#credentialAccessKey").value.trim(),
+      secret_access_key: $("#credentialSecretKey").value,
+      session_token: $("#credentialSessionToken").value.trim() || null,
+    });
+  } else {
+    const authMethod = $("#credentialSftpAuthMethod").value;
+    Object.assign(payload, {
+      username: $("#credentialSftpUsername").value.trim(),
+      auth_method: authMethod,
+      password:
+        authMethod === "password"
+          ? $("#credentialSftpPassword").value
+          : null,
+      private_key:
+        authMethod === "private_key"
+          ? $("#credentialSftpPrivateKey").value.trim()
+          : null,
+      private_key_passphrase:
+        authMethod === "private_key"
+          ? $("#credentialSftpPassphrase").value || null
+          : null,
+    });
+  }
   let valid = true;
-  for (const [field, message] of [
-    ["profile", "请输入配置名称。"],
-    ["access_key_id", "请输入 Access Key ID。"],
-    ["secret_access_key", "请输入 Secret Access Key。"],
-  ]) {
+  const requiredFields =
+    kind === "sftp"
+      ? [
+          ["profile", "请输入配置名称。"],
+          ["username", "请输入 SFTP 用户名。"],
+          [
+            payload.auth_method === "private_key" ? "private_key" : "password",
+            payload.auth_method === "private_key"
+              ? "请粘贴完整的 SSH 私钥。"
+              : "请输入 SFTP 密码。",
+          ],
+        ]
+      : [
+          ["profile", "请输入配置名称。"],
+          ["access_key_id", "请输入 Access Key ID。"],
+          ["secret_access_key", "请输入 Secret Access Key。"],
+        ];
+  for (const [field, message] of requiredFields) {
     if (!payload[field]) {
       setFieldError(form, field, message);
       valid = false;
@@ -2717,6 +3162,14 @@ function bindEvents() {
   $("#scrubForm").addEventListener("submit", submitScrub);
 
   $("#credentialForm").addEventListener("submit", saveCredential);
+  $$(`input[name="credential_kind"]`).forEach((radio) => {
+    radio.addEventListener("change", () => {
+      if (radio.checked) toggleCredentialFields(radio.value);
+    });
+  });
+  $("#credentialSftpAuthMethod").addEventListener("change", (event) => {
+    toggleSftpAuthenticationFields(event.target.value);
+  });
   $("#authForm").addEventListener("submit", submitAuthentication);
   $("#authDialog").addEventListener("cancel", (event) => {
     event.preventDefault();
@@ -2727,6 +3180,16 @@ function bindEvents() {
     input.type = showing ? "password" : "text";
     $("#toggleSecretButton").textContent = showing ? "显示" : "隐藏";
     $("#toggleSecretButton").setAttribute("aria-label", showing ? "显示密钥" : "隐藏密钥");
+  });
+  $("#toggleSftpPasswordButton").addEventListener("click", () => {
+    const input = $("#credentialSftpPassword");
+    const showing = input.type === "text";
+    input.type = showing ? "password" : "text";
+    $("#toggleSftpPasswordButton").textContent = showing ? "显示" : "隐藏";
+    $("#toggleSftpPasswordButton").setAttribute(
+      "aria-label",
+      showing ? "显示密码" : "隐藏密码",
+    );
   });
   $("#activityDockDismiss").addEventListener("click", () => {
     const active = [...state.operations]

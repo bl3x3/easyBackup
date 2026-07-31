@@ -55,12 +55,14 @@ package "基础设施适配器" as Adapters #FAF5FF {
   interface "BlobStore" as BlobStore
   component "LocalBlobStore" as Local
   component "S3BlobStore\nboto3 multipart" as S3
+  component "SFTPBlobStore\nParamiko · 独立会话" as SFTP
 }
 
 folder "源目录" as Source
 folder "恢复目标目录" as Target
 node "OS Keyring / 机器绑定\nAES-256-GCM 文件" as SecretBackend
 node "外部工具\nxdelta3 · zstd" as Tools
+node "SFTP / SSH 服务器\n远端文件系统" as SFTPServer
 
 SPA --> Security : HTTP / WebSocket
 Security --> REST
@@ -106,7 +108,10 @@ Locks --> BlobStore : 远端 TTL 租约
 
 Local ..|> BlobStore
 S3 ..|> BlobStore
+SFTP ..|> BlobStore
 S3 --> Credentials
+SFTP --> Credentials
+SFTP --> SFTPServer : SSH / SFTP\nOPEN_EXCL + posix-rename
 Credentials --> SecretBackend
 Archive --> Tools : zstd（可选）
 Delta --> Tools : xdelta3 + zstd
@@ -126,6 +131,12 @@ end note
 note bottom of Delta
   生成 Patch 后立即反向解码并校验目标 SHA-256；
   工具缺失、Base 不可用、验证失败或收益不足时回退完整分卷。
+end note
+
+note bottom of SFTP
+  每次数据操作与租约心跳使用独立会话；
+  配置探针验证排他创建、原子覆盖与并发会话。
+  遗留 .cas.guard 时 fail-closed，不自动删除。
 end note
 
 @enduml

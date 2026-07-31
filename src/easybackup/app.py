@@ -51,6 +51,7 @@ from easybackup.models import (
     RestoreRequest,
     RunRequest,
     S3StorageConfig,
+    SFTPStorageConfig,
     ScrubRequest,
     StorageProbeRequest,
     Task,
@@ -458,7 +459,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="EasyBackup",
         version=__version__,
-        description="本地优先、分卷流式、支持 S3 的增量备份控制中心。",
+        description="本地优先、分卷流式、支持 S3 与 SFTP 的增量备份控制中心。",
         lifespan=lifespan,
         docs_url="/api/docs",
         redoc_url=None,
@@ -615,8 +616,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             except (CredentialError, NotFoundError) as exc:
                 storage = payload.storage
-                if not isinstance(storage, S3StorageConfig):
+                if not isinstance(
+                    storage,
+                    (S3StorageConfig, SFTPStorageConfig),
+                ):
                     raise
+                is_sftp = isinstance(storage, SFTPStorageConfig)
                 diagnostic = {
                     "kind": "credential_profile",
                     "title": (
@@ -627,23 +632,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "summary": exc.message,
                     "suggestions": [
                         "在“存储与密钥”中创建或更新同名凭据配置。",
-                        "凭据配置名称区分大小写；阿里云 OSS 请保存 RAM AccessKey。",
+                        (
+                            "凭据配置名称区分大小写；SFTP 凭据需选择密码或私钥认证。"
+                            if is_sftp
+                            else "凭据配置名称区分大小写；阿里云 OSS 请保存 RAM AccessKey。"
+                        ),
                     ],
                     "operation": "读取凭据配置",
                     "provider": (
-                        "aliyun_oss"
-                        if "aliyuncs.com" in (storage.endpoint_url or "")
-                        else "s3_compatible"
+                        "sftp"
+                        if is_sftp
+                        else (
+                            "aliyun_oss"
+                            if "aliyuncs.com" in (storage.endpoint_url or "")
+                            else "s3_compatible"
+                        )
                     ),
-                    "endpoint": storage.endpoint_url or "AWS 默认 Endpoint",
-                    "bucket": storage.bucket,
-                    "region": storage.region,
                 }
+                if is_sftp:
+                    diagnostic.update(
+                        {
+                            "host": storage.host,
+                            "port": storage.port,
+                            "base_path": storage.base_path,
+                        }
+                    )
+                else:
+                    diagnostic.update(
+                        {
+                            "endpoint": (
+                                storage.endpoint_url
+                                or "AWS 默认 Endpoint"
+                            ),
+                            "bucket": storage.bucket,
+                            "region": storage.region,
+                        }
+                    )
                 raise exc.__class__(
                     exc.message,
                     details={"diagnostic": diagnostic},
                 ) from exc
 
+            capabilities = None
+            validate_capabilities = getattr(
+                store,
+                "validate_capabilities",
+                None,
+            )
+            if callable(validate_capabilities):
+                capabilities = await asyncio.to_thread(
+                    validate_capabilities
+                )
             stored = await asyncio.to_thread(
                 store.put_bytes,
                 probe_key,
@@ -673,33 +712,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await asyncio.to_thread(store.delete, probe_key)
 
         storage = payload.storage
-        target = (
-            str(Path(storage.path).expanduser().resolve())
-            if isinstance(storage, LocalStorageConfig)
-            else (
+        if isinstance(storage, LocalStorageConfig):
+            target = str(Path(storage.path).expanduser().resolve())
+            connection = None
+        elif isinstance(storage, S3StorageConfig):
+            target = (
                 f"s3://{storage.bucket}/"
                 f"{storage.prefix.strip('/')}"
             ).rstrip("/")
-        )
+            connection = {
+                "provider": getattr(store, "provider", "s3_compatible"),
+                "endpoint": storage.endpoint_url or "AWS 默认 Endpoint",
+                "region": storage.region,
+                "addressing_style": getattr(
+                    store, "addressing_style", "auto"
+                ),
+                "signature_version": getattr(
+                    store, "signature_version", "default"
+                ),
+            }
+        else:
+            host = (
+                f"[{storage.host}]"
+                if ":" in storage.host
+                else storage.host
+            )
+            target = (
+                f"sftp://{host}:{storage.port}/"
+                f"{storage.base_path.lstrip('/')}"
+            ).rstrip("/")
+            connection = {
+                "provider": "sftp",
+                "host": storage.host,
+                "port": storage.port,
+                "base_path": storage.base_path,
+                "host_key_verification": (
+                    "fingerprint"
+                    if storage.host_key_fingerprint
+                    else (
+                        "known_hosts"
+                        if storage.known_hosts_path
+                        else "system_known_hosts"
+                    )
+                ),
+                "capabilities": capabilities,
+            }
         return {
             "ok": True,
             "kind": storage.kind,
             "target": target,
-            "connection": (
-                {
-                    "provider": getattr(store, "provider", "s3_compatible"),
-                    "endpoint": storage.endpoint_url or "AWS 默认 Endpoint",
-                    "region": storage.region,
-                    "addressing_style": getattr(
-                        store, "addressing_style", "auto"
-                    ),
-                    "signature_version": getattr(
-                        store, "signature_version", "default"
-                    ),
-                }
-                if isinstance(storage, S3StorageConfig)
-                else None
-            ),
+            "connection": connection,
             "latency_ms": max(
                 1,
                 round((time.monotonic() - started) * 1000),
@@ -937,7 +999,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database: Database = request.app.state.database
         for task in database.list_tasks():
             if (
-                isinstance(task.storage, S3StorageConfig)
+                isinstance(
+                    task.storage,
+                    (S3StorageConfig, SFTPStorageConfig),
+                )
                 and task.storage.credential_profile == profile
             ):
                 raise ConflictError(

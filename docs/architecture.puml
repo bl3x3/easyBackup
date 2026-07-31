@@ -39,6 +39,7 @@ node "EasyBackup 主机\nWindows / Linux / macOS" as Host {
 node "操作系统凭据服务\nKeyring / Credential Manager" as Keyring
 folder "本地备份仓库" as LocalStore
 cloud "S3 兼容对象存储\nAWS S3 · MinIO · OSS*" as S3Store
+node "SFTP / SSH 服务器\n远端 POSIX 文件系统" as SFTPStore
 
 Operator --> Client
 Client --> App : loopback HTTP / WebSocket\n或进程内 CLI / 托盘
@@ -50,6 +51,7 @@ Credentials --> Keyring : 优先
 Credentials --> DataDir : 机器绑定加密文件回退
 App --> LocalStore : BlobStore 文件系统适配器
 App --> S3Store : HTTPS / multipart\n条件写入租约
+App --> SFTPStore : SSH / SFTP\n原子 rename + OPEN_EXCL 租约
 
 note bottom of Client
   默认地址：http://127.0.0.1:8765
@@ -58,13 +60,19 @@ note bottom of Client
 end note
 
 note bottom of LocalStore
-  本地仓库与 S3 使用同一对象协议：
+  本地仓库、S3 与 SFTP 使用同一逻辑对象协议：
   volumes / patches / manifest.json / commit.json。
 end note
 
 note bottom of S3Store
   一个任务前缀应由一个权威 SQLite / 写入主机管理。
   远端租约降低冲突，但不是严格 fencing token。
+end note
+
+note bottom of SFTPStore
+  严格校验 SSH 主机密钥。
+  服务器必须支持 OPEN_EXCL、posix-rename，
+  并允许至少两个并发 SFTP 会话。
 end note
 
 @enduml
