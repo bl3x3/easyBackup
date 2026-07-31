@@ -2758,6 +2758,15 @@ main {
   color: var(--danger);
 }
 
+.storage-test-bar.is-stale {
+  border-color: rgba(245, 158, 11, 0.32);
+  background: var(--warning-soft);
+}
+
+.storage-test-bar.is-stale small {
+  color: var(--warning);
+}
+
 #storageTestStatus.is-testing {
   color: #60a5fa;
 }
@@ -2768,6 +2777,207 @@ main {
 
 #storageTestStatus.is-error {
   color: var(--danger);
+}
+
+#storageTestStatus.is-stale {
+  color: var(--warning);
+}
+
+.storage-diagnostic {
+  display: grid;
+  gap: 11px;
+  margin-top: 10px;
+  padding: 13px;
+  overflow: hidden;
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  border-radius: 9px;
+  background:
+    linear-gradient(135deg, rgba(248, 113, 113, 0.08), transparent 55%),
+    var(--bg-input);
+}
+
+.storage-diagnostic-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.storage-diagnostic-mark {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgba(248, 113, 113, 0.34);
+  border-radius: 8px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.storage-diagnostic-header small {
+  display: block;
+  margin-bottom: 1px;
+  color: var(--danger);
+  font-size: 8px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.storage-diagnostic-header h3 {
+  margin: 0;
+  color: var(--text-main);
+  font-size: 13px;
+}
+
+.storage-diagnostic > p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.storage-diagnostic-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+}
+
+.storage-diagnostic-fact {
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, 0.7);
+}
+
+.storage-diagnostic-fact dt {
+  color: var(--text-faint);
+  font-size: 8px;
+}
+
+.storage-diagnostic-fact dd {
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 9px;
+}
+
+.storage-diagnostic-actions {
+  padding-top: 9px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.storage-diagnostic-actions strong {
+  color: var(--text-secondary);
+  font-size: 9px;
+}
+
+.storage-diagnostic-actions ol {
+  display: grid;
+  gap: 4px;
+  margin: 5px 0 0;
+  padding-left: 18px;
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.storage-troubleshooting {
+  margin-top: 10px;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  background: rgba(15, 23, 42, 0.52);
+}
+
+.storage-troubleshooting summary {
+  display: flex;
+  min-height: 43px;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 36px 9px 12px;
+  cursor: pointer;
+  list-style: none;
+  position: relative;
+}
+
+.storage-troubleshooting summary::-webkit-details-marker {
+  display: none;
+}
+
+.storage-troubleshooting summary::after {
+  position: absolute;
+  top: 50%;
+  right: 13px;
+  color: var(--text-faint);
+  content: "＋";
+  font-size: 13px;
+  transform: translateY(-50%);
+  transition: transform var(--transition), color var(--transition);
+}
+
+.storage-troubleshooting[open] summary::after {
+  color: var(--accent);
+  transform: translateY(-50%) rotate(45deg);
+}
+
+.storage-troubleshooting summary:hover {
+  background: var(--bg-hover);
+}
+
+.storage-troubleshooting summary:focus-visible {
+  outline: 3px solid rgba(59, 130, 246, 0.35);
+  outline-offset: -3px;
+}
+
+.storage-troubleshooting summary span {
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.storage-troubleshooting summary small {
+  color: var(--text-faint);
+  font-size: 8px;
+}
+
+.storage-troubleshooting-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding: 11px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.storage-troubleshooting article {
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  background: var(--bg-input);
+}
+
+.storage-troubleshooting article b {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text-secondary);
+  font-size: 9px;
+}
+
+.storage-troubleshooting article p {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 8px;
+}
+
+.storage-troubleshooting code,
+.field small code {
+  padding: 1px 3px;
+  overflow-wrap: anywhere;
+  font-size: 0.95em;
 }
 
 #taskScheduleField input[readonly] {
@@ -3570,6 +3780,17 @@ main {
 
   .storage-test-bar .button {
     width: 100%;
+  }
+
+  .storage-diagnostic-facts,
+  .storage-troubleshooting-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .storage-troubleshooting summary {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 1px;
   }
 
   .modal-footer {

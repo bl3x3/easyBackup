@@ -20,6 +20,20 @@ const SCHEDULE_PRESETS = {
   "daily-23": "0 23 * * *",
   "weekly-1": "0 2 * * 1",
 };
+const STORAGE_PROBE_IDLE_MESSAGE = "保存任务前，可验证写入、读取与删除权限。";
+const STORAGE_CONFIG_FIELD_SELECTOR =
+  'input[name="storage_kind"], input[name^="storage."]';
+const STORAGE_DIAGNOSTIC_FACTS = [
+  ["kind", "诊断类型"],
+  ["problem_code", "问题代码"],
+  ["provider_code", "服务商错误码"],
+  ["http_status", "HTTP 状态"],
+  ["request_id", "请求 ID"],
+  ["endpoint", "Endpoint"],
+  ["bucket", "Bucket"],
+  ["region", "Region"],
+  ["operation", "失败操作"],
+];
 const VIEW_META = {
   dashboard: {
     eyebrow: "CONTROL ROOM",
@@ -75,6 +89,9 @@ const state = {
   authPromise: null,
   authResolve: null,
   dismissedOperationId: "",
+  storageProbeRevision: 0,
+  storageProbePending: false,
+  storageProbeMode: "",
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -453,6 +470,7 @@ function setFieldError(form, path, message) {
   const candidates = [
     path,
     path.replace(/^task\./, ""),
+    path.replace(/^storage\.(?:s3|local)\./, "storage."),
     path.replace(/^storage\./, "storage."),
     path.split(".").slice(-1)[0],
   ];
@@ -716,9 +734,253 @@ function setStorageProbeStatus(message, mode = "") {
   const bar = status.closest(".storage-test-bar");
   status.textContent = message;
   status.className = mode ? `is-${mode}` : "";
+  state.storageProbeMode = mode;
   if (bar) {
-    bar.classList.remove("is-testing", "is-success", "is-error");
+    bar.classList.remove("is-testing", "is-success", "is-error", "is-stale");
     if (mode) bar.classList.add(`is-${mode}`);
+  }
+}
+
+function clearStorageDiagnostic() {
+  const panel = $("#storageDiagnosticPanel");
+  if (!panel) return;
+  panel.classList.add("is-hidden");
+  $("#storageDiagnosticTitle").textContent = "存储配置不可用";
+  $("#storageDiagnosticSummary").textContent = "";
+  clear($("#storageDiagnosticFacts"));
+  clear($("#storageDiagnosticSuggestions"));
+  $("#storageDiagnosticActions").classList.remove("is-hidden");
+}
+
+function normalizeDiagnosticSuggestions(value) {
+  const entries = Array.isArray(value) ? value : value ? [value] : [];
+  return entries
+    .map((entry) => {
+      if (typeof entry === "string") return entry.trim();
+      if (entry && typeof entry === "object") {
+        return String(entry.message ?? entry.text ?? entry.suggestion ?? "").trim();
+      }
+      return "";
+    })
+    .filter(Boolean);
+}
+
+function fallbackStorageDiagnostic(error, storage) {
+  const payload = error?.payload && typeof error.payload === "object" ? error.payload : {};
+  const diagnosticKind = String(payload?.details?.diagnostic?.kind ?? "").trim();
+  const problemCode = String(payload?.code ?? payload?.error?.problem_code ?? "").trim();
+  const providerCode = String(
+    payload?.details?.provider_code ??
+      payload?.error?.code ??
+      payload?.provider_code ??
+      "",
+  ).trim();
+  const signal = `${diagnosticKind} ${problemCode} ${providerCode} ${error?.message ?? ""}`
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
+  let title = "无法验证存储配置";
+  let summary = error?.message || "存储服务未返回可识别的诊断信息。";
+  let suggestions = [
+    "核对存储类型、Endpoint、Bucket、Region 与凭据配置后重新检测。",
+    "展开下方“常见配置错误”，按网络、权限和签名顺序排查。",
+    "如仍失败，请保留服务商错误码和请求 ID，以便进一步定位。",
+  ];
+
+  if (signal.includes("publicendpointforbidden")) {
+    title = "当前环境禁止使用公网 Endpoint";
+    summary = "对象存储拒绝了公网服务地址，通常与 Bucket、账号或运行环境的网络访问策略有关。";
+    suggestions = [
+      "阿里云 OSS 可为 Bucket 绑定自定义域名（CNAME）后改用该地址。",
+      "若 EasyBackup 运行在 Bucket 同地域的阿里云网络中，可改用内网 Endpoint。",
+      "检查 Bucket、账号与运行环境是否还有额外网络访问限制。",
+    ];
+  } else if (
+    signal.includes("invalidendpoint") ||
+    signal.includes("invalidurl") ||
+    signal.includes("endpointurlformat")
+  ) {
+    title = "Endpoint URL 格式不完整";
+    summary = "Endpoint 必须包含有效主机名；EasyBackup 会为裸域名自动补全 HTTPS。";
+    suggestions = [
+      "建议使用 https:// 开头的完整服务地址。",
+      "阿里云上海地域可填写 https://s3.oss-cn-shanghai.aliyuncs.com。",
+      "Endpoint 中不要包含 Bucket 名称、s3:// 前缀、查询参数或账号密码。",
+    ];
+  } else if (
+    signal.includes("endpointconnection") ||
+    signal.includes("endpointunreachable") ||
+    signal.includes("timeout") ||
+    signal.includes("timedout") ||
+    signal.includes("dns") ||
+    signal.includes("nameresolution") ||
+    signal.includes("getaddrinfo") ||
+    signal.includes("ssl") ||
+    signal.includes("tls") ||
+    signal.includes("certificate")
+  ) {
+    title = "无法建立 DNS / TLS 连接";
+    summary = "主机无法解析或安全连接到 Endpoint，请先检查网络路径、代理和证书。";
+    suggestions = [
+      "确认运行 EasyBackup 的主机能够解析 Endpoint 域名并访问 443 端口。",
+      "检查防火墙、系统代理、企业 TLS 检查和自签名证书设置。",
+      "若使用内网 Endpoint，请确认当前主机位于对应 VPC 或已配置专线 / VPN。",
+    ];
+  } else if (
+    diagnosticKind === "bucket" ||
+    signal.includes("nosuchbucket") ||
+    signal.includes("regionendpoint") ||
+    signal.includes("bucketnotexist") ||
+    signal.includes("invalidbucket") ||
+    signal.includes("permanentredirect") ||
+    signal.includes("regionmismatch") ||
+    signal.includes("authorizationheadermalformed")
+  ) {
+    title = "Bucket 或 Region 不匹配";
+    summary = "服务地址可以访问，但目标 Bucket 不存在、名称有误，或 Region 与 Bucket 所在地域不一致。";
+    suggestions = [
+      "Bucket 只填写名称，不要带 s3://、路径或 Endpoint 域名。",
+      "在云控制台确认 Bucket 所在地域，并填写对应 Region。",
+      "确保 Endpoint 与 Region 指向同一地域，例如上海对应 cn-shanghai。",
+    ];
+  } else if (
+    signal.includes("signaturedoesnotmatch") ||
+    signal.includes("signature") ||
+    signal.includes("clock") ||
+    signal.includes("invalidsignature") ||
+    signal.includes("requesttimetoolskewed") ||
+    signal.includes("requestexpired")
+  ) {
+    title = "请求签名或系统时间无效";
+    summary = "对象存储无法验证当前请求签名，常见原因是密钥、Region、Endpoint 或系统时间不正确。";
+    suggestions = [
+      "同步运行 EasyBackup 主机的系统时间和时区后重试。",
+      "重新核对 AK/SK，避免复制到前后空格、混用旧密钥或遗漏临时 Token。",
+      "确认 Region 和 Endpoint 与服务商的 S3 兼容签名要求一致。",
+    ];
+  } else if (
+    signal.includes("invalidaccesskey") ||
+    signal.includes("credentialprofile") ||
+    signal.includes("credential") ||
+    signal.includes("permission") ||
+    signal.includes("accessdenied") ||
+    signal.includes("unauthorized") ||
+    signal.includes("forbidden")
+  ) {
+    title = "凭据不存在或权限不足";
+    summary = "当前凭据无法完成探针所需的写入、读取元数据、读取和删除操作。";
+    suggestions = [
+      "确认任务引用的凭据配置名称正确，且 AK/SK 仍然有效。",
+      "授予该凭据对目标 Bucket 和对象前缀的写入、读取与删除权限。",
+      "若使用临时凭据，请同时填写有效的 Session Token 并检查过期时间。",
+    ];
+  } else if (
+    signal.includes("unsupportedoperation") ||
+    signal.includes("addressingstyle")
+  ) {
+    title = "当前 S3 兼容模式不受支持";
+    summary = "服务商不支持探针使用的对象操作，或 Bucket 寻址方式与当前 Endpoint 不兼容。";
+    suggestions = [
+      "确认填写的是服务商提供的 S3 兼容 Endpoint，而不是原生 API 或控制台地址。",
+      "检查服务商是否要求 path-style 或 virtual-hosted-style Bucket 寻址。",
+      "确认兼容接口支持写入、读取元数据、读取和删除对象。",
+    ];
+  } else if (signal.includes("throttled") || signal.includes("slowdown")) {
+    title = "对象存储请求受到限流";
+    summary = "服务商暂时限制了探针请求频率，并不一定表示配置错误。";
+    suggestions = [
+      "稍候片刻再重新检测，避免短时间连续提交连接测试。",
+      "检查账号或 Bucket 的请求配额与流控告警。",
+      "若持续发生，请携带请求 ID 联系服务商确认限流原因。",
+    ];
+  }
+
+  return {
+    title,
+    summary,
+    suggestions,
+    kind: diagnosticKind || null,
+    problem_code: problemCode || null,
+    provider_code: providerCode || null,
+    http_status: payload?.status ?? error?.status ?? null,
+    request_id:
+      payload?.details?.request_id ??
+      payload?.error?.request_id ??
+      payload?.request_id ??
+      null,
+    endpoint: storage?.kind === "s3" ? storage.endpoint_url : null,
+    bucket: storage?.kind === "s3" ? storage.bucket : null,
+    region: storage?.kind === "s3" ? storage.region : null,
+  };
+}
+
+function storageDiagnosticFromError(error, storage) {
+  const payload = error?.payload && typeof error.payload === "object" ? error.payload : {};
+  const supplied = payload?.details?.diagnostic;
+  const fallback = fallbackStorageDiagnostic(error, storage);
+  if (!supplied || typeof supplied !== "object" || Array.isArray(supplied)) {
+    return fallback;
+  }
+
+  const suggestions = normalizeDiagnosticSuggestions(supplied.suggestions);
+  return {
+    ...fallback,
+    kind: supplied.kind ?? fallback.kind,
+    title: supplied.title || payload.title || fallback.title,
+    summary: supplied.summary || payload.detail || fallback.summary,
+    suggestions: suggestions.length ? suggestions : fallback.suggestions,
+    problem_code: supplied.problem_code ?? payload.code ?? fallback.problem_code,
+    provider_code: supplied.provider_code ?? fallback.provider_code,
+    http_status: supplied.http_status ?? payload.status ?? fallback.http_status,
+    request_id: supplied.request_id ?? fallback.request_id,
+    endpoint: supplied.endpoint ?? fallback.endpoint,
+    bucket: supplied.bucket ?? fallback.bucket,
+    region: supplied.region ?? fallback.region,
+    operation: supplied.operation ?? fallback.operation,
+  };
+}
+
+function renderStorageDiagnostic(diagnostic) {
+  const panel = $("#storageDiagnosticPanel");
+  const facts = $("#storageDiagnosticFacts");
+  const suggestions = $("#storageDiagnosticSuggestions");
+  clear(facts);
+  clear(suggestions);
+  $("#storageDiagnosticTitle").textContent =
+    diagnostic?.title || "存储配置不可用";
+  $("#storageDiagnosticSummary").textContent =
+    diagnostic?.summary || "请检查存储配置后重试。";
+
+  for (const [key, label] of STORAGE_DIAGNOSTIC_FACTS) {
+    const value = diagnostic?.[key];
+    if (value === undefined || value === null || value === "") continue;
+    const row = element("div", "storage-diagnostic-fact");
+    append(row, element("dt", "", label), element("dd", "", value));
+    facts.append(row);
+  }
+
+  const items = normalizeDiagnosticSuggestions(diagnostic?.suggestions);
+  for (const item of items) suggestions.append(element("li", "", item));
+  $("#storageDiagnosticActions").classList.toggle("is-hidden", !items.length);
+  panel.classList.remove("is-hidden");
+}
+
+function resetStorageProbe() {
+  state.storageProbeRevision += 1;
+  clearStorageDiagnostic();
+  setStorageProbeStatus(STORAGE_PROBE_IDLE_MESSAGE);
+}
+
+function invalidateStorageProbe() {
+  const previousMode = state.storageProbeMode;
+  state.storageProbeRevision += 1;
+  clearStorageDiagnostic();
+  if (state.storageProbePending) {
+    setStorageProbeStatus(
+      "配置已变化；当前检测完成后将标记为过期，请重新检测。",
+      "stale",
+    );
+  } else if (["success", "error", "stale"].includes(previousMode)) {
+    setStorageProbeStatus("配置已修改，上次检测结果已失效，请重新检测。", "stale");
   }
 }
 
@@ -973,7 +1235,7 @@ function resetTaskForm() {
   $("#taskId").value = "";
   $("#taskDialogTitle").textContent = "新建备份任务";
   $("#taskFormStatus").textContent = "";
-  setStorageProbeStatus("保存任务前，可验证写入、读取与删除权限。");
+  resetStorageProbe();
   $("#taskEnabled").checked = true;
   $("#taskCompression").value = "auto";
   $("#taskCompressionLevel").value = "3";
@@ -1082,15 +1344,68 @@ function collectTaskPayload() {
   };
 }
 
+function setEndpointFormatError(message = "") {
+  const target = $('[data-error-for="storage.endpoint_url"]', $("#taskForm"));
+  if (!target) return;
+  target.textContent = message;
+  target.closest(".field")?.classList.toggle("has-error", Boolean(message));
+}
+
+function normalizeS3EndpointInput({ showError = false } = {}) {
+  const input = $("#s3Endpoint");
+  const raw = input.value.trim();
+  if (!raw) {
+    if (showError) setEndpointFormatError();
+    return { value: null, error: "" };
+  }
+
+  const candidate = /^[a-z][a-z\d+.-]*:\/\//i.test(raw)
+    ? raw
+    : `https://${raw}`;
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    const error = "Endpoint URL 无法解析，请填写完整的服务地址。";
+    if (showError) setEndpointFormatError(error);
+    return { value: raw, error };
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname) {
+    const error = "Endpoint URL 仅支持 http:// 或 https://。";
+    if (showError) setEndpointFormatError(error);
+    return { value: raw, error };
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  if (/^oss-[a-z0-9-]+\.aliyuncs\.com$/i.test(hostname)) {
+    parsed.hostname = `s3.${hostname}`;
+  }
+
+  let normalized = parsed.toString();
+  if (
+    parsed.pathname === "/" &&
+    !parsed.search &&
+    !parsed.hash &&
+    normalized.endsWith("/")
+  ) {
+    normalized = normalized.slice(0, -1);
+  }
+  input.value = normalized;
+  if (showError) setEndpointFormatError();
+  return { value: normalized, error: "" };
+}
+
 function collectStoragePayload() {
   const kind = $(`input[name="storage_kind"]:checked`)?.value ?? "local";
   if (kind === "s3") {
+    const endpoint = normalizeS3EndpointInput();
     return {
       kind: "s3",
       bucket: $("#s3Bucket").value.trim(),
       prefix: $("#s3Prefix").value.trim() || "easybackup",
       region: $("#s3Region").value.trim() || null,
-      endpoint_url: $("#s3Endpoint").value.trim() || null,
+      endpoint_url: endpoint.value,
       credential_profile: $("#s3CredentialProfile").value.trim() || "default",
       storage_class: $("#s3StorageClass").value.trim() || null,
       multipart_chunk_mb: numberOr($("#s3ChunkSize").value, 16),
@@ -1106,6 +1421,7 @@ async function testStorageConfiguration() {
   const form = $("#taskForm");
   const storage = collectStoragePayload();
   clearFormErrors(form);
+  clearStorageDiagnostic();
   if (storage.kind === "local" && !storage.path) {
     setFieldError(form, "storage.path", "请先输入备份存放目录。");
     setStorageProbeStatus("请先补充本地存储路径。", "error");
@@ -1116,8 +1432,26 @@ async function testStorageConfiguration() {
     setStorageProbeStatus("请先补充 S3 / OSS Bucket。", "error");
     return;
   }
+  const endpointValidation =
+    storage.kind === "s3"
+      ? normalizeS3EndpointInput({ showError: true })
+      : { value: null, error: "" };
+  if (endpointValidation.error) {
+    const message = endpointValidation.error;
+    setFieldError(form, "storage.endpoint_url", message);
+    setStorageProbeStatus(message, "error");
+    renderStorageDiagnostic(
+      fallbackStorageDiagnostic(
+        new ApiError(message, 0, { code: "INVALID_ENDPOINT_URL" }),
+        storage,
+      ),
+    );
+    return;
+  }
 
   const button = $("#testStorageButton");
+  const requestRevision = state.storageProbeRevision;
+  state.storageProbePending = true;
   setButtonBusy(button, true, "检测中…");
   setStorageProbeStatus("正在执行写入、读取与删除探针…", "testing");
   try {
@@ -1125,15 +1459,28 @@ async function testStorageConfiguration() {
       method: "POST",
       body: { storage },
     });
+    if (requestRevision !== state.storageProbeRevision) {
+      clearStorageDiagnostic();
+      setStorageProbeStatus("检测结果已过期：配置在检测期间发生变化，请重新检测。", "stale");
+      return;
+    }
+    clearStorageDiagnostic();
     setStorageProbeStatus(`✓ ${result.message}（${result.latency_ms} ms）`, "success");
     showToast("存储配置可用", `${result.target} · ${result.latency_ms} ms`);
   } catch (error) {
+    if (requestRevision !== state.storageProbeRevision) {
+      clearStorageDiagnostic();
+      setStorageProbeStatus("检测结果已过期：配置在检测期间发生变化，请重新检测。", "stale");
+      return;
+    }
     for (const issue of error.fieldErrors ?? []) {
       setFieldError(form, issue.path, issue.message);
     }
+    renderStorageDiagnostic(storageDiagnosticFromError(error, storage));
     setStorageProbeStatus(`检测失败：${error.message}`, "error");
     showToast("存储配置不可用", error.message, "error");
   } finally {
+    state.storageProbePending = false;
     setButtonBusy(button, false);
   }
 }
@@ -2298,8 +2645,15 @@ function bindEvents() {
   $$(`input[name="storage_kind"]`).forEach((radio) => {
     radio.addEventListener("change", () => {
       toggleStorageFields(radio.value);
-      setStorageProbeStatus("保存任务前，可验证写入、读取与删除权限。");
     });
+  });
+  $("#taskForm").addEventListener("input", (event) => {
+    if (event.target.matches(STORAGE_CONFIG_FIELD_SELECTOR)) {
+      invalidateStorageProbe();
+    }
+  });
+  $("#s3Endpoint").addEventListener("blur", () => {
+    normalizeS3EndpointInput({ showError: true });
   });
   $("#taskSchedulePreset").addEventListener("change", (event) => {
     applySchedulePreset(event.target.value);

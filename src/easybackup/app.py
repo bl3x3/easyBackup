@@ -33,7 +33,9 @@ from easybackup.db import Database
 from easybackup.engine import BackupEngine, MaintenanceEngine, RestoreEngine
 from easybackup.errors import (
     ConflictError,
+    CredentialError,
     EasyBackupError,
+    NotFoundError,
     StorageError,
     ValidationError,
 )
@@ -595,10 +597,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         """Verify read/write/delete access without retaining probe data."""
 
-        store = create_store(
-            payload.storage,
-            request.app.state.credentials,
-        )
         probe_key = (
             "v1/system/probes/"
             f"{secrets.token_hex(16)}.probe"
@@ -606,9 +604,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         probe_payload = (
             b"easybackup-storage-configuration-probe-v1\n"
         )
+        store = None
         uploaded = False
         started = time.monotonic()
         try:
+            try:
+                store = create_store(
+                    payload.storage,
+                    request.app.state.credentials,
+                )
+            except (CredentialError, NotFoundError) as exc:
+                storage = payload.storage
+                if not isinstance(storage, S3StorageConfig):
+                    raise
+                diagnostic = {
+                    "kind": "credential_profile",
+                    "title": (
+                        "凭据配置不存在"
+                        if isinstance(exc, NotFoundError)
+                        else "无法读取凭据配置"
+                    ),
+                    "summary": exc.message,
+                    "suggestions": [
+                        "在“存储与密钥”中创建或更新同名凭据配置。",
+                        "凭据配置名称区分大小写；阿里云 OSS 请保存 RAM AccessKey。",
+                    ],
+                    "operation": "读取凭据配置",
+                    "provider": (
+                        "aliyun_oss"
+                        if "aliyuncs.com" in (storage.endpoint_url or "")
+                        else "s3_compatible"
+                    ),
+                    "endpoint": storage.endpoint_url or "AWS 默认 Endpoint",
+                    "bucket": storage.bucket,
+                    "region": storage.region,
+                }
+                raise exc.__class__(
+                    exc.message,
+                    details={"diagnostic": diagnostic},
+                ) from exc
+
             stored = await asyncio.to_thread(
                 store.put_bytes,
                 probe_key,
@@ -634,7 +669,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "存储探针读回内容与写入内容不一致。"
                 )
         finally:
-            if uploaded:
+            if store is not None and uploaded:
                 await asyncio.to_thread(store.delete, probe_key)
 
         storage = payload.storage
@@ -650,6 +685,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "ok": True,
             "kind": storage.kind,
             "target": target,
+            "connection": (
+                {
+                    "provider": getattr(store, "provider", "s3_compatible"),
+                    "endpoint": storage.endpoint_url or "AWS 默认 Endpoint",
+                    "region": storage.region,
+                    "addressing_style": getattr(
+                        store, "addressing_style", "auto"
+                    ),
+                    "signature_version": getattr(
+                        store, "signature_version", "default"
+                    ),
+                }
+                if isinstance(storage, S3StorageConfig)
+                else None
+            ),
             "latency_ms": max(
                 1,
                 round((time.monotonic() - started) * 1000),

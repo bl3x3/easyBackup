@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import (
     BaseModel,
@@ -35,6 +36,66 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def is_aliyun_oss_endpoint(endpoint_url: str | None) -> bool:
+    """Return whether an endpoint uses an Alibaba Cloud OSS service domain."""
+
+    if not endpoint_url:
+        return False
+    try:
+        hostname = (urlsplit(endpoint_url).hostname or "").lower()
+    except ValueError:
+        return False
+    labels = hostname.split(".")
+    return (
+        len(labels) >= 3
+        and labels[-2:] == ["aliyuncs", "com"]
+        and any(label.startswith("oss-") for label in labels[:-2])
+    )
+
+
+def normalize_s3_endpoint_url(value: object) -> str | None:
+    """Normalize a user-entered S3 endpoint into a complete service URL."""
+
+    if value is None:
+        return None
+    endpoint = str(value).strip()
+    if not endpoint:
+        return None
+    if "://" not in endpoint:
+        endpoint = f"https://{endpoint}"
+
+    try:
+        parsed = urlsplit(endpoint)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Endpoint URL 格式无效。") from exc
+
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("Endpoint URL 仅支持 http:// 或 https://。")
+    if not parsed.hostname:
+        raise ValueError("Endpoint URL 缺少有效的主机名。")
+    if parsed.username or parsed.password:
+        raise ValueError("Endpoint URL 不能包含用户名或密码。")
+    if parsed.query or parsed.fragment:
+        raise ValueError("Endpoint URL 不能包含查询参数或片段。")
+
+    hostname = parsed.hostname.lower()
+    # boto3 accesses OSS through its S3-compatible service endpoint.  Users
+    # commonly paste the native OSS endpoint, so transparently upgrade the
+    # service host while leaving bucket domains and custom CNAMEs untouched.
+    if (
+        hostname.startswith("oss-")
+        and hostname.endswith(".aliyuncs.com")
+    ):
+        hostname = f"s3.{hostname}"
+
+    host_for_netloc = f"[{hostname}]" if ":" in hostname else hostname
+    netloc = f"{host_for_netloc}:{port}" if port is not None else host_for_netloc
+    path = parsed.path.rstrip("/")
+    return urlunsplit((scheme, netloc, path, "", ""))
+
+
 class LocalStorageConfig(StrictModel):
     kind: Literal["local"] = "local"
     path: str = Field(min_length=1)
@@ -49,6 +110,11 @@ class S3StorageConfig(StrictModel):
     credential_profile: str = "default"
     storage_class: str | None = None
     multipart_chunk_mb: int = Field(default=16, ge=5, le=512)
+
+    @field_validator("endpoint_url", mode="before")
+    @classmethod
+    def normalize_endpoint_url(cls, value: object) -> str | None:
+        return normalize_s3_endpoint_url(value)
 
 
 StorageConfig = Annotated[
@@ -411,6 +477,20 @@ class CredentialWrite(StrictModel):
     access_key_id: str = Field(min_length=1)
     secret_access_key: str = Field(min_length=1)
     session_token: str | None = None
+
+    @field_validator(
+        "profile",
+        "access_key_id",
+        "secret_access_key",
+        "session_token",
+        mode="before",
+    )
+    @classmethod
+    def strip_credential_whitespace(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
 
 
 class ApiSessionRequest(StrictModel):

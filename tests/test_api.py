@@ -27,6 +27,8 @@ def test_api_task_backup_flow(tmp_path):
     ) as client:
         root = client.get("/")
         assert root.headers["x-frame-options"] == "DENY"
+        assert 'id="storageDiagnosticPanel"' in root.text
+        assert "s3.oss-cn-shanghai.aliyuncs.com" in root.text
         assert "frame-ancestors 'none'" in root.headers[
             "content-security-policy"
         ]
@@ -136,6 +138,57 @@ def test_storage_configuration_probe_is_verified_and_removed(tmp_path):
         assert result["latency_ms"] >= 1
         assert repository.is_dir()
         assert not list(repository.rglob("*.probe"))
+
+
+def test_s3_configuration_probe_reports_actionable_common_errors(tmp_path):
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        open_browser=False,
+        credential_backend="encrypted_file",
+    )
+    with TestClient(
+        create_app(settings),
+        base_url="http://127.0.0.1",
+    ) as client:
+        missing_credential = client.post(
+            "/api/v1/storage/test",
+            json={
+                "storage": {
+                    "kind": "s3",
+                    "bucket": "backup-dinnerparty",
+                    "endpoint_url": "oss-cn-shanghai.aliyuncs.com",
+                    "region": "cn-shanghai",
+                    "credential_profile": "aliyun",
+                }
+            },
+        )
+        assert missing_credential.status_code == 404
+        problem = missing_credential.json()
+        diagnostic = problem["details"]["diagnostic"]
+        assert diagnostic["kind"] == "credential_profile"
+        assert diagnostic["endpoint"] == (
+            "https://s3.oss-cn-shanghai.aliyuncs.com"
+        )
+        assert diagnostic["suggestions"]
+
+        invalid_endpoint = client.post(
+            "/api/v1/storage/test",
+            json={
+                "storage": {
+                    "kind": "s3",
+                    "bucket": "backup-dinnerparty",
+                    "endpoint_url": "ftp://oss-cn-shanghai.aliyuncs.com",
+                    "credential_profile": "aliyun",
+                }
+            },
+        )
+        assert invalid_endpoint.status_code == 422
+        field_errors = invalid_endpoint.json()["field_errors"]
+        assert any(
+            issue["path"] == "storage.s3.endpoint_url"
+            or issue["path"] == "storage.endpoint_url"
+            for issue in field_errors
+        )
 
 
 def test_api_token_browser_session_and_websocket(tmp_path):

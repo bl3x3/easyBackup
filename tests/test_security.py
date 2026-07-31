@@ -4,6 +4,7 @@ import pytest
 
 from easybackup.errors import NotFoundError
 from easybackup.models import CredentialWrite
+from easybackup.models import CredentialWrite
 from easybackup.security import redact_sensitive
 
 
@@ -25,6 +26,20 @@ def test_encrypted_file_credentials_never_list_secrets(credentials):
     credentials.delete("s3-prod")
     with pytest.raises(NotFoundError):
         credentials.get("s3-prod")
+
+
+def test_credential_input_strips_copy_paste_whitespace():
+    value = CredentialWrite(
+        profile=" aliyun ",
+        access_key_id=" LTAIexample ",
+        secret_access_key=" secret-value\r\n",
+        session_token=" token-value ",
+    )
+
+    assert value.profile == "aliyun"
+    assert value.access_key_id == "LTAIexample"
+    assert value.secret_access_key == "secret-value"
+    assert value.session_token == "token-value"
 
 
 def test_log_redaction():

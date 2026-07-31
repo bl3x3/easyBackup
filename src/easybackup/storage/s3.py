@@ -6,10 +6,10 @@ import io
 import json
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import BinaryIO, Iterator
+from typing import Any, BinaryIO, Iterator
 
 from easybackup.errors import CancelledError, StorageError
-from easybackup.models import S3StorageConfig
+from easybackup.models import S3StorageConfig, is_aliyun_oss_endpoint
 from easybackup.storage.base import (
     BlobStore,
     CancelCallback,
@@ -21,6 +21,296 @@ from easybackup.storage.base import (
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _error_response(exc: BaseException) -> dict[str, Any]:
+    for current in _exception_chain(exc):
+        response = getattr(current, "response", None)
+        if isinstance(response, dict):
+            return response
+    return {}
+
+
+def diagnose_s3_error(
+    exc: BaseException,
+    *,
+    config: S3StorageConfig,
+    operation: str,
+) -> dict[str, Any]:
+    """Classify a boto3/OSS error into safe, actionable UI diagnostics."""
+
+    response = _error_response(exc)
+    provider_error = response.get("Error", {})
+    metadata = response.get("ResponseMetadata", {})
+    provider_code = str(provider_error.get("Code", "") or "")
+    provider_message = " ".join(
+        str(provider_error.get("Message", "") or "").split()
+    )[:500]
+    http_status = metadata.get("HTTPStatusCode")
+    request_id = (
+        metadata.get("RequestId")
+        or metadata.get("RequestID")
+        or provider_error.get("RequestId")
+    )
+    class_names = {type(item).__name__ for item in _exception_chain(exc)}
+    raw_message = " ".join(str(item) for item in _exception_chain(exc))
+    searchable = f"{provider_code} {provider_message} {raw_message}".lower()
+
+    kind = "unknown"
+    title = "对象存储请求失败"
+    summary = provider_message or "服务端返回了未识别的错误。"
+    suggestions = [
+        "核对 Endpoint、Region、Bucket 与凭据配置后重试。",
+        "若问题持续，请结合服务端错误码和 Request ID 查询对象存储日志。",
+    ]
+
+    if (
+        "InvalidEndpoint" in class_names
+        or "invalid endpoint" in searchable
+        or isinstance(exc, ValueError)
+    ):
+        kind = "invalid_endpoint"
+        title = "Endpoint URL 格式无效"
+        summary = "Endpoint 必须是包含协议和主机名的完整 URL。"
+        suggestions = [
+            "使用 https:// 开头；不要只填写主机名。",
+            "阿里云上海 OSS 推荐填写 https://s3.oss-cn-shanghai.aliyuncs.com。",
+        ]
+    elif provider_code == "PublicEndpointForbidden":
+        kind = "public_endpoint_forbidden"
+        title = "OSS 公网 Endpoint 被策略禁用"
+        summary = "当前阿里云账号或 Bucket 不允许通过默认公网 Endpoint 访问。"
+        suggestions = [
+            "为 Bucket 绑定自定义域名（CNAME），并使用支持 CNAME 的 OSS 访问方式。",
+            "若 EasyBackup 与 Bucket 位于同一阿里云地域，可改用上海地域内网 Endpoint。",
+        ]
+    elif (
+        provider_code in {"NoSuchBucket", "InvalidBucketName"}
+        or "specified bucket does not exist" in searchable
+    ):
+        kind = "bucket"
+        title = "Bucket 不存在或名称无效"
+        summary = "服务端未找到该 Bucket，或 Bucket 名称不符合要求。"
+        suggestions = [
+            "确认 Bucket 名称拼写完全一致，且凭据所属账号有权看到它。",
+            "确认 Endpoint 与 Bucket 所在地域匹配。",
+        ]
+    elif provider_code in {
+        "PermanentRedirect",
+        "AuthorizationHeaderMalformed",
+        "IncorrectEndpoint",
+        "IllegalLocationConstraintException",
+    } or http_status in {301, 307}:
+        kind = "region_endpoint"
+        title = "Region 或 Endpoint 不匹配"
+        summary = "请求被发送到了与 Bucket 所在地域不一致的 Endpoint。"
+        suggestions = [
+            "将 Region 设置为 Bucket 的实际地域，例如 cn-shanghai。",
+            "阿里云 OSS 使用对应地域的 S3 兼容 Endpoint，例如 https://s3.oss-cn-shanghai.aliyuncs.com。",
+        ]
+    elif provider_code in {
+        "InvalidAccessKeyId",
+        "InvalidSecurityToken",
+        "SecurityTokenExpired",
+        "ExpiredToken",
+        "UnrecognizedClientException",
+        "TokenRefreshRequired",
+    }:
+        kind = "credentials"
+        title = "访问密钥无效或已过期"
+        summary = "服务端无法识别当前 AccessKey，或临时令牌已经失效。"
+        suggestions = [
+            "确认凭据配置保存的是当前阿里云账号或 RAM 用户的 AccessKey。",
+            "若使用临时 STS 凭据，请同时更新 Session Token 并检查有效期。",
+        ]
+    elif {
+        "NoCredentialsError",
+        "PartialCredentialsError",
+        "CredentialRetrievalError",
+    } & class_names:
+        kind = "credentials"
+        title = "访问密钥缺失或不完整"
+        summary = "S3 客户端没有获得完整的 AccessKey 与 Secret AccessKey。"
+        suggestions = [
+            "在“存储与密钥”中重新保存该凭据配置。",
+            "确认 AccessKey ID、Secret AccessKey 与可选 Session Token 均来自同一组凭据。",
+        ]
+    elif (
+        provider_code == "RequestTimeTooSkewed"
+        or provider_code == "RequestExpired"
+        or "clock skew" in searchable
+        or "request time" in searchable
+    ):
+        kind = "clock"
+        title = "系统时间偏差过大"
+        summary = "本机时间与对象存储服务端时间不一致，签名已被判定过期。"
+        suggestions = [
+            "启用 Windows 自动设置时间与时区，然后立即同步时间。",
+            "确保本机与标准时间的偏差小于 15 分钟后重试。",
+        ]
+    elif provider_code in {
+        "SignatureDoesNotMatch",
+        "InvalidSignatureException",
+        "InvalidArgument",
+    } and (
+        "signature" in searchable
+        or "authorization" in searchable
+        or "content-sha256" in searchable
+        or provider_code != "InvalidArgument"
+    ):
+        kind = "signature"
+        title = "请求签名不兼容"
+        summary = provider_message or "服务端拒绝了当前请求签名。"
+        suggestions = [
+            "核对 Secret AccessKey，避免复制时带入空格或换行。",
+            "阿里云 OSS 需要 S3 兼容签名与 virtual-hosted 寻址；EasyBackup 会对 aliyuncs.com Endpoint 自动启用。",
+        ]
+    elif (
+        provider_code in {"AccessDenied", "Forbidden", "Unauthorized"}
+        or http_status in {401, 403}
+    ) and provider_code not in {
+        "SecondLevelDomainForbidden",
+        "InvalidHostHeader",
+    }:
+        kind = "permission"
+        title = "凭据权限不足"
+        summary = provider_message or "服务端拒绝了当前凭据的对象操作权限。"
+        suggestions = [
+            "授予该 RAM 用户目标 Bucket/前缀的写入、读取、列举与删除权限。",
+            "同时检查 Bucket Policy、RAM Policy、防盗链和来源网络限制。",
+        ]
+    elif provider_code in {
+        "NotImplemented",
+        "MethodNotAllowed",
+        "UnsupportedOperation",
+    } or http_status == 501:
+        kind = "unsupported_operation"
+        title = "服务端不支持所需操作"
+        summary = provider_message or "该 S3 兼容服务未实现当前请求所需的语义。"
+        suggestions = [
+            "确认服务端支持标准 S3 API 与当前请求头。",
+            "若错误发生在远端租约，服务端必须支持条件 PutObject；请勿通过关闭锁绕过此安全检查。",
+        ]
+    elif provider_code in {
+        "SecondLevelDomainForbidden",
+        "InvalidHostHeader",
+    } or "path-style" in searchable or "virtual-host" in searchable:
+        kind = "addressing_style"
+        title = "对象存储寻址方式不兼容"
+        summary = "服务端要求使用 Bucket 子域名，而不是路径式访问。"
+        suggestions = [
+            "使用服务级 Endpoint，不要把 Bucket 名写进 Endpoint。",
+            "阿里云 OSS 仅支持 virtual-hosted style；EasyBackup 会对官方 OSS Endpoint 自动启用。",
+        ]
+    elif (
+        "SSLError" in class_names
+        or "SSLValidationError" in class_names
+        or "certificate_verify_failed" in searchable
+        or "tls" in searchable
+    ):
+        kind = "tls"
+        title = "TLS 证书校验失败"
+        summary = "无法验证 Endpoint 提供的 HTTPS 证书。"
+        suggestions = [
+            "确认 Endpoint 主机名与证书一致，且系统时间正确。",
+            "私有 MinIO 请安装受信任证书；不要为了绕过错误而关闭证书校验。",
+        ]
+    elif (
+        "ConnectTimeoutError" in class_names
+        or "ReadTimeoutError" in class_names
+        or "TimeoutError" in class_names
+        or "timed out" in searchable
+    ):
+        kind = "timeout"
+        title = "连接对象存储超时"
+        summary = "在超时时间内未能连接 Endpoint 或读取响应。"
+        suggestions = [
+            "检查网络、防火墙、代理和 Endpoint 可达性后重试。",
+            "若使用内网 Endpoint，确认 EasyBackup 运行在同一云网络或已建立专线/VPN。",
+        ]
+    elif (
+        "EndpointConnectionError" in class_names
+        or "ConnectionClosedError" in class_names
+        or "ConnectionError" in class_names
+        or "NameResolutionError" in class_names
+        or "ProxyConnectionError" in class_names
+        or "could not connect to the endpoint" in searchable
+        or "failed to connect to proxy" in searchable
+        or "name resolution" in searchable
+        or "getaddrinfo" in searchable
+    ):
+        kind = "endpoint_unreachable"
+        title = "Endpoint 无法连接"
+        summary = "无法解析或连接对象存储 Endpoint。"
+        suggestions = [
+            "检查 Endpoint 拼写、DNS、代理、防火墙和当前网络连接。",
+            "确认公网与内网 Endpoint 的选择符合 EasyBackup 所在网络。",
+        ]
+    elif provider_code in {
+        "SlowDown",
+        "Throttling",
+        "ThrottlingException",
+        "TooManyRequests",
+    } or http_status == 429:
+        kind = "throttled"
+        title = "请求频率受限"
+        summary = "对象存储暂时限制了当前请求频率。"
+        suggestions = [
+            "稍后重试，并检查账号或 Bucket 的请求配额。",
+            "若持续发生，请降低并发或联系服务商提升配额。",
+        ]
+
+    diagnostic: dict[str, Any] = {
+        "kind": kind,
+        "title": title,
+        "summary": summary,
+        "suggestions": suggestions,
+        "operation": operation,
+        "provider": (
+            "aliyun_oss"
+            if is_aliyun_oss_endpoint(config.endpoint_url)
+            else "s3_compatible"
+        ),
+        "endpoint": config.endpoint_url or "AWS 默认 Endpoint",
+        "bucket": config.bucket,
+        "region": config.region,
+    }
+    optional = {
+        "provider_code": provider_code or None,
+        "provider_message": provider_message or None,
+        "http_status": http_status,
+        "request_id": request_id,
+    }
+    diagnostic.update(
+        {key: value for key, value in optional.items() if value is not None}
+    )
+    return diagnostic
+
+
+def _storage_error(
+    exc: BaseException,
+    *,
+    config: S3StorageConfig,
+    operation: str,
+) -> StorageError:
+    diagnostic = diagnose_s3_error(
+        exc,
+        config=config,
+        operation=operation,
+    )
+    return StorageError(
+        f"{operation}失败：{diagnostic['summary']}",
+        details={"diagnostic": diagnostic},
+    )
 
 
 class _CancellableReader:
@@ -45,19 +335,64 @@ class S3BlobStore(BlobStore):
     ):
         try:
             import boto3
+            from botocore.config import Config
         except ImportError as exc:
-            raise StorageError("S3 后端需要安装 boto3。") from exc
-        kwargs = {
-            "aws_access_key_id": credentials["access_key_id"],
-            "aws_secret_access_key": credentials["secret_access_key"],
+            raise StorageError(
+                "S3 后端需要安装 boto3。",
+                details={
+                    "diagnostic": {
+                        "kind": "dependency",
+                        "title": "缺少 S3 客户端依赖",
+                        "summary": "当前 Python 环境未安装 boto3。",
+                        "suggestions": ["安装项目依赖后重新启动 EasyBackup。"],
+                        "operation": "初始化 S3 客户端",
+                    }
+                },
+            ) from exc
+
+        self.config = config
+        self.bucket = config.bucket
+        self.prefix = config.prefix.strip("/")
+        self.storage_class = config.storage_class
+        self.multipart_chunk = config.multipart_chunk_mb * 1024 * 1024
+        self.provider = (
+            "aliyun_oss"
+            if is_aliyun_oss_endpoint(config.endpoint_url)
+            else "s3_compatible"
+        )
+        self.addressing_style = (
+            "virtual" if self.provider == "aliyun_oss" else "auto"
+        )
+        self.signature_version = (
+            "s3" if self.provider == "aliyun_oss" else "default"
+        )
+
+        access_key = (credentials.get("access_key_id") or "").strip()
+        secret_key = (credentials.get("secret_access_key") or "").strip()
+        session_token = (credentials.get("session_token") or "").strip()
+        kwargs: dict[str, Any] = {
+            "aws_access_key_id": access_key,
+            "aws_secret_access_key": secret_key,
         }
-        if credentials.get("session_token"):
-            kwargs["aws_session_token"] = credentials["session_token"]
+        if session_token:
+            kwargs["aws_session_token"] = session_token
         if config.region:
             kwargs["region_name"] = config.region
         if config.endpoint_url:
             kwargs["endpoint_url"] = config.endpoint_url
-        self.client = boto3.client("s3", **kwargs)
+        if self.provider == "aliyun_oss":
+            kwargs["config"] = Config(
+                signature_version="s3",
+                s3={"addressing_style": "virtual"},
+            )
+        try:
+            self.client = boto3.client("s3", **kwargs)
+        except Exception as exc:
+            raise _storage_error(
+                exc,
+                config=config,
+                operation="初始化 S3 客户端",
+            ) from exc
         put_object = self.client.meta.service_model.operation_model(
             "PutObject"
         )
@@ -66,12 +401,17 @@ class S3BlobStore(BlobStore):
         if missing_conditions:
             raise StorageError(
                 "当前 boto3/botocore 过旧，S3 PutObject 不支持安全租约"
-                "所需的 If-Match/If-None-Match；请安装 boto3>=1.36。"
+                "所需的 If-Match/If-None-Match；请安装 boto3>=1.36。",
+                details={
+                    "diagnostic": {
+                        "kind": "client_too_old",
+                        "title": "S3 客户端版本过旧",
+                        "summary": "当前 boto3/botocore 缺少安全远端租约所需参数。",
+                        "suggestions": ["安装 boto3>=1.36 后重新启动 EasyBackup。"],
+                        "operation": "初始化 S3 客户端",
+                    }
+                },
             )
-        self.bucket = config.bucket
-        self.prefix = config.prefix.strip("/")
-        self.storage_class = config.storage_class
-        self.multipart_chunk = config.multipart_chunk_mb * 1024 * 1024
 
     def _key(self, key: str) -> str:
         value = key.replace("\\", "/").strip("/")
@@ -136,7 +476,11 @@ class S3BlobStore(BlobStore):
         except CancelledError:
             raise
         except Exception as exc:
-            raise StorageError(f"上传 S3 对象 {key!r} 失败：{exc}") from exc
+            raise _storage_error(
+                exc,
+                config=self.config,
+                operation=f"上传对象 {key!r}",
+            ) from exc
 
     def open_read(self, key: str) -> BinaryIO:
         try:
@@ -144,7 +488,11 @@ class S3BlobStore(BlobStore):
                 Bucket=self.bucket, Key=self._key(key)
             )["Body"]
         except Exception as exc:
-            raise StorageError(f"读取 S3 对象 {key!r} 失败：{exc}") from exc
+            raise _storage_error(
+                exc,
+                config=self.config,
+                operation=f"读取对象 {key!r}",
+            ) from exc
 
     def read_range(self, key: str, start: int, length: int) -> bytes:
         if start < 0 or length < 0:
@@ -162,7 +510,11 @@ class S3BlobStore(BlobStore):
             finally:
                 body.close()
         except Exception as exc:
-            raise StorageError(f"范围读取 S3 对象失败：{exc}") from exc
+            raise _storage_error(
+                exc,
+                config=self.config,
+                operation=f"范围读取对象 {key!r}",
+            ) from exc
 
     def stat(self, key: str) -> ObjectStat | None:
         try:
@@ -180,7 +532,11 @@ class S3BlobStore(BlobStore):
             code = str(response.get("Error", {}).get("Code", ""))
             if code in {"404", "NoSuchKey", "NotFound"}:
                 return None
-            raise StorageError(f"读取 S3 对象元数据失败：{exc}") from exc
+            raise _storage_error(
+                exc,
+                config=self.config,
+                operation=f"读取对象元数据 {key!r}",
+            ) from exc
 
     def iter_objects(self, prefix: str = "") -> Iterator[ObjectStat]:
         backend_prefix = self._key(prefix) if prefix else (
@@ -199,13 +555,21 @@ class S3BlobStore(BlobStore):
                         modified_at=value.get("LastModified"),
                     )
         except Exception as exc:
-            raise StorageError(f"列举 S3 对象失败：{exc}") from exc
+            raise _storage_error(
+                exc,
+                config=self.config,
+                operation="列举对象",
+            ) from exc
 
     def delete(self, key: str) -> None:
         try:
             self.client.delete_object(Bucket=self.bucket, Key=self._key(key))
         except Exception as exc:
-            raise StorageError(f"删除 S3 对象 {key!r} 失败：{exc}") from exc
+            raise _storage_error(
+                exc,
+                config=self.config,
+                operation=f"删除对象 {key!r}",
+            ) from exc
 
     def _read_lease(self, key: str) -> tuple[dict, str] | None:
         try:
@@ -223,7 +587,11 @@ class S3BlobStore(BlobStore):
             code = str(response.get("Error", {}).get("Code", ""))
             if code in {"404", "NoSuchKey", "NotFound"}:
                 return None
-            raise StorageError(f"读取 S3 远端锁失败：{exc}") from exc
+            raise _storage_error(
+                exc,
+                config=self.config,
+                operation="读取远端租约",
+            ) from exc
 
     def _conditional_put(
         self, key: str, value: dict, *, if_none: bool = False, etag: str | None = None
@@ -251,7 +619,11 @@ class S3BlobStore(BlobStore):
                 412,
             }:
                 return None
-            raise StorageError(f"更新 S3 远端锁失败：{exc}") from exc
+            raise _storage_error(
+                exc,
+                config=self.config,
+                operation="更新远端租约",
+            ) from exc
 
     def acquire_lease(
         self, key: str, owner: str, ttl_seconds: int
@@ -333,4 +705,8 @@ class S3BlobStore(BlobStore):
                         count += 1
             return count
         except Exception as exc:
-            raise StorageError(f"清理过期 S3 分片上传失败：{exc}") from exc
+            raise _storage_error(
+                exc,
+                config=self.config,
+                operation="清理过期分片上传",
+            ) from exc

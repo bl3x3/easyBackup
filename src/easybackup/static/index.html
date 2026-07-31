@@ -463,7 +463,9 @@
             <div class="form-grid two">
               <label class="field">
                 <span>Endpoint URL</span>
-                <input id="s3Endpoint" name="storage.endpoint_url" type="url" placeholder="留空使用 AWS；OSS/MinIO 请填写">
+                <input id="s3Endpoint" name="storage.endpoint_url" type="url" placeholder="https://s3.oss-cn-shanghai.aliyuncs.com">
+                <small>建议填写完整 URL；裸域名会自动补全 HTTPS。阿里云 OSS 示例：<code>https://s3.oss-cn-shanghai.aliyuncs.com</code></small>
+                <small class="field-error" data-error-for="storage.endpoint_url"></small>
               </label>
               <label class="field">
                 <span>Region</span>
@@ -488,6 +490,53 @@
             </span>
             <button class="button button-secondary small" id="testStorageButton" type="button">检测配置</button>
           </div>
+          <section class="storage-diagnostic is-hidden" id="storageDiagnosticPanel" aria-labelledby="storageDiagnosticTitle">
+            <header class="storage-diagnostic-header">
+              <span class="storage-diagnostic-mark" aria-hidden="true">!</span>
+              <div>
+                <small>连接诊断</small>
+                <h3 id="storageDiagnosticTitle">存储配置不可用</h3>
+              </div>
+            </header>
+            <p id="storageDiagnosticSummary"></p>
+            <dl class="storage-diagnostic-facts" id="storageDiagnosticFacts"></dl>
+            <div class="storage-diagnostic-actions" id="storageDiagnosticActions">
+              <strong>建议检查</strong>
+              <ol id="storageDiagnosticSuggestions"></ol>
+            </div>
+          </section>
+          <details class="storage-troubleshooting">
+            <summary>
+              <span>连接不上？查看常见配置错误</span>
+              <small>Endpoint、网络、权限与签名排查</small>
+            </summary>
+            <div class="storage-troubleshooting-grid">
+              <article>
+                <b>Endpoint URL</b>
+                <p>建议填写包含协议的完整服务地址；裸域名会自动补全 HTTPS，阿里云原生服务域也会升级为对应的 S3 兼容地址。</p>
+              </article>
+              <article>
+                <b>DNS / TLS</b>
+                <p>确认运行 EasyBackup 的主机能解析 Endpoint，并能通过 443 端口建立 TLS 连接；代理和自签名证书也可能拦截请求。</p>
+              </article>
+              <article>
+                <b>Bucket / Region</b>
+                <p>Bucket 只填写名称，不要带 <code>s3://</code>；Region 必须与 Bucket 所在地域一致，例如上海为 <code>cn-shanghai</code>。</p>
+              </article>
+              <article>
+                <b>凭据与权限</b>
+                <p>确认所选凭据配置存在且 AK/SK 有效，并允许在目标前缀执行写入、读取、读取元数据和删除对象。</p>
+              </article>
+              <article>
+                <b>签名与系统时间</b>
+                <p>签名不匹配通常由错误的 AK/SK、Region、Endpoint 或主机时间偏差引起；请先同步系统时间后重试。</p>
+              </article>
+              <article>
+                <b>PublicEndpointForbidden</b>
+                <p>阿里云禁止默认公网 Endpoint 时，请使用绑定到 Bucket 的自定义 CNAME；同地域云主机也可改用内网 Endpoint。</p>
+              </article>
+            </div>
+          </details>
         </fieldset>
 
         <fieldset class="form-section">
