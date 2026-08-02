@@ -56,6 +56,7 @@ from easybackup.models import (
     SnapshotManifest,
     SnapshotStatus,
     Task,
+    storage_location_identity,
     utc_now_iso,
 )
 from easybackup.scanner import ScannedFile, assert_files_unchanged, scan_source
@@ -139,8 +140,8 @@ class BackupEngine:
                         latest = None
                     storage_changed = bool(
                         latest
-                        and latest.storage.model_dump(mode="json")
-                        != task.storage.model_dump(mode="json")
+                        and storage_location_identity(latest.storage)
+                        != storage_location_identity(task.storage)
                     )
                     full_due = bool(
                         latest

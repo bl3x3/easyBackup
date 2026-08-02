@@ -36,6 +36,7 @@ EasyBackup 通过 Web 控制台管理本地目录到本地仓库、S3 兼容对�
 ### 环境要求
 
 - Python 3.10 或更高版本。
+- 阿里云 OSS 原生租约支持由项目的核心依赖 `alibabacloud-oss-v2>=1.3,<2` 提供，执行 `pip install -e .` 时会一并安装。
 - SFTP 支持由项目的核心依赖 `Paramiko>=4,<6` 提供，执行 `pip install -e .` 时会一并安装。
 - 普通备份不依赖外部 `tar`：归档由 Python 标准库生成。
 - `zstd` 为推荐压缩工具；`compression=auto` 在缺少它时自动使用 `gzip`。
@@ -85,7 +86,7 @@ python -m venv .venv
 1. S3 或 SFTP 目标先在“凭据”中创建对应协议的 Profile；SFTP 可选择“密码”或“SSH 私钥 + 可选 Passphrase”，本地目标可跳过。
 2. SFTP 首次连接时，使用管理员提供的 OpenSSH `SHA256:...` 主机密钥指纹，或准备可信的 `known_hosts` 文件；不要把检测页展示的未受信指纹直接视为可信。
 3. 创建任务并设置源目录、存储目标、Cron、排除规则、分卷与差分参数。
-4. 使用“测试连接”验证目标可写、可读取、可查询元数据并可删除。SFTP 还会验证排他创建、原子重命名、并发会话与可续期租约。
+4. 使用“测试连接”验证目标可写、可读取、可查询元数据并可删除。阿里云 OSS 还会验证原生 AppendObject position CAS 与可续期租约；SFTP 还会验证排他创建、原子重命名、并发会话与可续期租约。
 5. 先运行一次全量备份，再检查快照 Manifest 与文件版本。
 6. 对测试目录执行选择性恢复，并运行抽样或深度巡检。
 
@@ -215,6 +216,31 @@ v1/tasks/{task_id}/
 
 `.env.example` 仅作为配置参考；项目不会自动读取 `.env`。请通过 PowerShell、Shell、容器或服务管理器注入变量。
 
+### 阿里云 OSS 存储目标
+
+阿里云 OSS 在 Web UI 和任务 API 中仍配置为 `S3` 目标。分卷、Patch、Manifest 与 Commit 等数据对象继续通过 OSS 的 S3 兼容 Endpoint 读写；`write.lock.json` 远端租约则由官方 OSS SDK 调用原生 `AppendObject`，使用 `position` 条件实现 CAS，避免 S3 兼容接口不支持条件 `PutObject` 导致租约失败。
+
+```json
+{
+  "kind": "s3",
+  "bucket": "backup-dinnerparty",
+  "prefix": "easybackup",
+  "region": "cn-shanghai",
+  "endpoint_url": "https://s3.oss-cn-shanghai.aliyuncs.com",
+  "credential_profile": "aliyun",
+  "storage_class": null,
+  "multipart_chunk_mb": 16,
+  "upload_limit_mbps": 0
+}
+```
+
+- `region` 为必填项，并且必须与 Bucket 所在地域一致，例如上海填写 `cn-shanghai`。
+- 数据 Endpoint 使用对应地域的 S3 兼容地址；若填写 `oss-cn-shanghai.aliyuncs.com`，EasyBackup 会自动补全 HTTPS 并转换为 `https://s3.oss-cn-shanghai.aliyuncs.com`。
+- `storage_class` 可留空以继承 Bucket 的存储类别；需要显式指定时使用 S3 兼容值，例如 `STANDARD` 或 `STANDARD_IA`。
+- `upload_limit_mbps` 是单个任务的 S3/OSS 上传带宽上限，单位为网络常用的 Mbps（兆比特/秒）；`0` 表示不限速，非零值至少为 `1`。启用限速时 EasyBackup 会强制使用支持带宽控制的 boto3 classic transfer manager，普通上传与 Multipart Upload 使用同一上限。较低的最小值也保证取消操作能在有限时间内被传输器观察到。
+- AccessKey 由 S3 类型的凭据 Profile 提供。原生 OSS SDK 已是项目核心依赖，无需另行安装；升级后请重新执行 `pip install -e .`。
+- 保存配置后运行“测试连接”。除对象上传、读取、元数据查询与删除外，检测还会实际获取、续期并释放一次原生 OSS 租约；只有可续期租约验证通过，目标才适合用于备份。
+
 ### SFTP 存储目标
 
 SFTP 任务只在 SQLite 中保存连接参数与凭据 Profile 名称，用户名、密码、私钥和私钥 Passphrase 均由 CredentialStore 管理。以下 JSON 与任务 API 中的 `storage` 字段一致；Web UI 会生成同样的配置：
@@ -269,11 +295,12 @@ EasyBackup 不只测试“能否登录”。正式使用前，服务器还必须
 
 - **完整性**：客户端计算压缩对象 SHA-256，并以块 CRC32 支持抽样巡检；不把 S3 ETag 当作完整性证明。
 - **恢复安全**：校验 Commit、Manifest、对象和最终文件；拒绝绝对路径、`..`、越界链接与平台非法路径，使用同目录临时文件原子发布。
-- **并发控制**：每任务本地文件锁配合远端带 TTL 的租约，降低重复执行和多实例写入冲突。SFTP 通过 `OPEN_EXCL` guard 串行化租约更新，并通过 POSIX rename 原子发布对象。
+- **并发控制**：每任务本地文件锁配合远端带 TTL 的租约，降低重复执行和多实例写入冲突。阿里云 OSS 通过原生 `AppendObject` position CAS 更新租约；SFTP 通过 `OPEN_EXCL` guard 串行化租约更新，并通过 POSIX rename 原子发布对象。
 - **凭据保护**：`auto` 优先操作系统 Keyring，失败时回退机器绑定 AES-256-GCM 文件；S3 密钥以及 SFTP 密码、私钥和 Passphrase 均不写入任务表、快照或日志。
 - **SSH 主机身份**：SFTP 使用经过核对的 SHA-256 指纹、指定 `known_hosts` 或系统 `known_hosts`；未知或不匹配的主机密钥会 fail-closed，不使用 TOFU 自动接受。
 - **网络边界**：默认仅监听 loopback。绑定非本机地址必须设置 API Token，并应配置可信 TLS 反向代理、来源限制和正式身份认证。
 - **可运维性**：SQLite WAL、结构化操作状态、WebSocket 进度、取消、抽样/深度巡检、完整链保留与启动对账。
+- **控制平面响应性**：扫描与传输在工作线程运行；高频进度采用 latest-wins 合并并限制为每秒最多 4 次，避免大文件哈希期间阻塞 HTTP、WebSocket 与退出信号。服务关闭时会先向活动操作发送取消请求，再等待其安全释放本地锁和远端租约。
 
 ## 已知限制
 

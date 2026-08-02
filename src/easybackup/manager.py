@@ -26,6 +26,95 @@ from easybackup.models import (
 logger = logging.getLogger(__name__)
 
 
+class _ProgressRelay:
+    """Bound progress delivery from worker threads to the event loop.
+
+    Backup pipelines can report progress much faster than SQLite and WebSocket
+    consumers can persist it. Keeping only the newest pending update prevents
+    ``call_soon_threadsafe`` from creating an unbounded callback backlog that
+    would otherwise starve HTTP requests and signal handling.
+    """
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        callback: Callable[[ProgressUpdate], None],
+        *,
+        min_interval_seconds: float = 0.25,
+    ) -> None:
+        self._loop = loop
+        self._callback = callback
+        self._min_interval_seconds = max(0.0, min_interval_seconds)
+        self._lock = threading.Lock()
+        self._latest: ProgressUpdate | None = None
+        self._scheduled = False
+        self._closed = False
+        self._next_delivery_at = 0.0
+
+    def emit(self, update: ProgressUpdate) -> None:
+        should_schedule = False
+        with self._lock:
+            if self._closed:
+                return
+            self._latest = update
+            if not self._scheduled:
+                self._scheduled = True
+                should_schedule = True
+        if should_schedule:
+            self._loop.call_soon_threadsafe(self._schedule_drain)
+
+    def close(self) -> None:
+        """Drop pending non-terminal progress before storing final state."""
+
+        with self._lock:
+            self._closed = True
+            self._latest = None
+
+    def _schedule_drain(self) -> None:
+        with self._lock:
+            if self._closed:
+                self._scheduled = False
+                return
+        delay = max(0.0, self._next_delivery_at - self._loop.time())
+        if delay:
+            self._loop.call_later(delay, self._drain)
+        else:
+            self._drain()
+
+    def _drain(self) -> None:
+        with self._lock:
+            if self._closed:
+                self._latest = None
+                self._scheduled = False
+                return
+            update = self._latest
+            self._latest = None
+            if update is None:
+                self._scheduled = False
+                return
+
+        try:
+            self._callback(update)
+        finally:
+            self._next_delivery_at = (
+                self._loop.time() + self._min_interval_seconds
+            )
+            with self._lock:
+                if self._closed:
+                    self._latest = None
+                    self._scheduled = False
+                    should_reschedule = False
+                elif self._latest is None:
+                    self._scheduled = False
+                    should_reschedule = False
+                else:
+                    should_reschedule = True
+            if should_reschedule:
+                self._loop.call_later(
+                    self._min_interval_seconds, self._drain
+                )
+
+
 @dataclass(slots=True)
 class _ActiveOperation:
     operation_id: str
@@ -203,6 +292,10 @@ class OperationManager:
         function: Callable,
     ) -> None:
         loop = asyncio.get_running_loop()
+        progress_relay = _ProgressRelay(
+            loop,
+            functools.partial(self._apply_progress, operation.id),
+        )
         current = self.database.update_operation(
             operation.id,
             status=OperationStatus.RUNNING,
@@ -214,15 +307,11 @@ class OperationManager:
             {"operation": current.model_dump(mode="json")},
         )
 
-        def emit(update: ProgressUpdate) -> None:
-            loop.call_soon_threadsafe(
-                self._apply_progress, operation.id, update
-            )
-
         try:
             result = await asyncio.to_thread(
-                function, cancel_event.is_set, emit
+                function, cancel_event.is_set, progress_relay.emit
             )
+            progress_relay.close()
             stats = (
                 result.model_dump(mode="json")
                 if hasattr(result, "model_dump")
@@ -242,6 +331,7 @@ class OperationManager:
                 {"operation": current.model_dump(mode="json")},
             )
         except CancelledError as exc:
+            progress_relay.close()
             current = self.database.update_operation(
                 operation.id,
                 status=OperationStatus.CANCELLED,
@@ -254,6 +344,7 @@ class OperationManager:
                 {"operation": current.model_dump(mode="json")},
             )
         except Exception as exc:
+            progress_relay.close()
             logger.exception("操作 %s 执行失败", operation.id)
             current = self.database.update_operation(
                 operation.id,
@@ -267,6 +358,7 @@ class OperationManager:
                 {"operation": current.model_dump(mode="json")},
             )
         finally:
+            progress_relay.close()
             active = self._active_by_id.pop(operation.id, None)
             if active:
                 self._active_by_task.pop(active.task_id, None)
@@ -319,12 +411,16 @@ class OperationManager:
 
     async def shutdown(self, timeout: int) -> None:
         self.stop_accepting()
-        tasks = [active.task for active in self._active_by_id.values()]
+        active_operations = list(self._active_by_id.values())
+        for active in active_operations:
+            active.cancel.set()
+        tasks = [active.task for active in active_operations]
         if not tasks:
             return
         done, pending = await asyncio.wait(tasks, timeout=timeout)
         del done
         if pending:
-            for active in self._active_by_id.values():
-                active.cancel.set()
-            await asyncio.wait(pending, timeout=5)
+            logger.warning(
+                "等待 %d 个后台操作安全停止超时；进程退出将继续等待其释放资源。",
+                len(pending),
+            )

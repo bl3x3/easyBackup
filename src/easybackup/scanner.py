@@ -6,6 +6,7 @@ import fnmatch
 import hashlib
 import os
 import stat
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable
@@ -16,6 +17,11 @@ from easybackup.models import ManifestDirectory, ManifestFile
 
 CancelCallback = Callable[[], bool]
 ScanProgress = Callable[[int, int], None]
+
+
+_SCAN_PROGRESS_MIN_INTERVAL_SECONDS = 0.25
+_SCAN_PROGRESS_MIN_BYTES = 64 * 1024 * 1024
+_SCAN_PROGRESS_MIN_FILES = 1_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,12 +120,31 @@ def scan_source(
     hashed_bytes = 0
     seen_casefold: dict[str, str] = {}
     visited_directories: set[tuple[int, int]] = set()
+    last_progress_at = time.monotonic()
+    last_progress_files = 0
+    last_progress_bytes = 0
+
+    def report_progress(*, force: bool = False) -> None:
+        nonlocal last_progress_at, last_progress_files, last_progress_bytes
+        if progress is None:
+            return
+        now = time.monotonic()
+        file_count = len(files)
+        if not force and not (
+            now - last_progress_at >= _SCAN_PROGRESS_MIN_INTERVAL_SECONDS
+            or file_count - last_progress_files >= _SCAN_PROGRESS_MIN_FILES
+            or hashed_bytes - last_progress_bytes >= _SCAN_PROGRESS_MIN_BYTES
+        ):
+            return
+        progress(file_count, hashed_bytes)
+        last_progress_at = now
+        last_progress_files = file_count
+        last_progress_bytes = hashed_bytes
 
     def add_hashed(delta: int) -> None:
         nonlocal hashed_bytes
         hashed_bytes += delta
-        if progress:
-            progress(len(files), hashed_bytes)
+        report_progress()
 
     for root_text, dir_names, file_names in os.walk(
         source, topdown=True, followlinks=follow_symlinks
@@ -261,9 +286,9 @@ def scan_source(
                 )
             )
             total_bytes += value.st_size
-            if progress:
-                progress(len(files), hashed_bytes)
+            report_progress()
 
+    report_progress(force=True)
     files.sort(key=lambda item: item.path)
     directories.sort(key=lambda item: item.path)
     current_paths = {item.path for item in files}

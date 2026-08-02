@@ -476,7 +476,7 @@
                 <input id="s3Region" name="storage.region" type="text" placeholder="例如：ap-east-1">
               </label>
             </div>
-            <div class="form-grid two">
+            <div class="form-grid three">
               <label class="field">
                 <span>存储类别</span>
                 <input id="s3StorageClass" name="storage.storage_class" type="text" placeholder="例如：STANDARD_IA">
@@ -484,6 +484,12 @@
               <label class="field">
                 <span>分片大小（MB）</span>
                 <input id="s3ChunkSize" name="storage.multipart_chunk_mb" type="number" min="5" max="512" value="16">
+              </label>
+              <label class="field">
+                <span>上传限速（Mbps）</span>
+                <input id="s3UploadLimit" name="storage.upload_limit_mbps" type="number" min="0" max="100000" step="0.1" value="0">
+                <small>按单个备份任务限制上传带宽；0 表示不限速。</small>
+                <small class="field-error" data-error-for="storage.upload_limit_mbps"></small>
               </label>
             </div>
           </div>

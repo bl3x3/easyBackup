@@ -32,6 +32,7 @@ from easybackup.models import (
     SnapshotStatus,
     StorageConfig,
     Task,
+    storage_location_identity,
     utc_now_iso,
 )
 from easybackup.security import CredentialStore
@@ -272,7 +273,7 @@ class MaintenanceEngine:
         for chain_id, values in removable:
             identities = {
                 json.dumps(
-                    item.storage.model_dump(mode="json"),
+                    storage_location_identity(item.storage),
                     sort_keys=True,
                     separators=(",", ":"),
                 )

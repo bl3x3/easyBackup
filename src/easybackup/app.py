@@ -730,6 +730,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "signature_version": getattr(
                     store, "signature_version", "default"
                 ),
+                "capabilities": capabilities,
             }
         else:
             host = (

@@ -319,9 +319,23 @@ class _CancellableReader:
         self.cancelled = cancelled
 
     def read(self, size: int = -1) -> bytes:
+        self._check_cancelled()
+        if size is None or size < 0:
+            return self.raw.read(size)
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining:
+            self._check_cancelled()
+            chunk = self.raw.read(remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _check_cancelled(self) -> None:
         if self.cancelled and self.cancelled():
             raise CancelledError("操作已取消。")
-        return self.raw.read(size)
 
     def seekable(self) -> bool:
         return False
@@ -355,6 +369,11 @@ class S3BlobStore(BlobStore):
         self.prefix = config.prefix.strip("/")
         self.storage_class = config.storage_class
         self.multipart_chunk = config.multipart_chunk_mb * 1024 * 1024
+        self.upload_limit_bytes_per_second = (
+            int(config.upload_limit_mbps * 1_000_000 / 8)
+            if config.upload_limit_mbps > 0
+            else None
+        )
         self.provider = (
             "aliyun_oss"
             if is_aliyun_oss_endpoint(config.endpoint_url)
@@ -393,25 +412,38 @@ class S3BlobStore(BlobStore):
                 config=config,
                 operation="初始化 S3 客户端",
             ) from exc
-        put_object = self.client.meta.service_model.operation_model(
-            "PutObject"
-        )
-        members = set(put_object.input_shape.members)
-        missing_conditions = {"IfMatch", "IfNoneMatch"} - members
-        if missing_conditions:
-            raise StorageError(
-                "当前 boto3/botocore 过旧，S3 PutObject 不支持安全租约"
-                "所需的 If-Match/If-None-Match；请安装 boto3>=1.36。",
-                details={
-                    "diagnostic": {
-                        "kind": "client_too_old",
-                        "title": "S3 客户端版本过旧",
-                        "summary": "当前 boto3/botocore 缺少安全远端租约所需参数。",
-                        "suggestions": ["安装 boto3>=1.36 后重新启动 EasyBackup。"],
-                        "operation": "初始化 S3 客户端",
-                    }
-                },
+        self._aliyun_lease = None
+        if self.provider == "aliyun_oss":
+            from easybackup.storage.aliyun_lease import (
+                create_aliyun_oss_lease_store,
             )
+
+            self._aliyun_lease = create_aliyun_oss_lease_store(
+                config,
+                credentials,
+            )
+        else:
+            put_object = self.client.meta.service_model.operation_model(
+                "PutObject"
+            )
+            members = set(put_object.input_shape.members)
+            missing_conditions = {"IfMatch", "IfNoneMatch"} - members
+            if missing_conditions:
+                raise StorageError(
+                    "当前 boto3/botocore 过旧，S3 PutObject 不支持安全租约"
+                    "所需的 If-Match/If-None-Match；请安装 boto3>=1.36。",
+                    details={
+                        "diagnostic": {
+                            "kind": "client_too_old",
+                            "title": "S3 客户端版本过旧",
+                            "summary": "当前 boto3/botocore 缺少安全远端租约所需参数。",
+                            "suggestions": [
+                                "安装 boto3>=1.36 后重新启动 EasyBackup。"
+                            ],
+                            "operation": "初始化 S3 客户端",
+                        }
+                    },
+                )
 
     def _key(self, key: str) -> str:
         value = key.replace("\\", "/").strip("/")
@@ -451,18 +483,33 @@ class S3BlobStore(BlobStore):
                 if progress:
                     progress(total)
 
+            transfer_config: dict[str, object] = {
+                "multipart_threshold": self.multipart_chunk,
+                "multipart_chunksize": self.multipart_chunk,
+                "max_concurrency": (
+                    1
+                    if self.upload_limit_bytes_per_second is not None
+                    else 4
+                ),
+                "use_threads": True,
+            }
+            if self.upload_limit_bytes_per_second is not None:
+                transfer_config.update(
+                    {
+                        "max_bandwidth": self.upload_limit_bytes_per_second,
+                        # CRT currently ignores max_bandwidth. Force the
+                        # classic transfer manager whenever throttling is on.
+                        "preferred_transfer_client": "classic",
+                    }
+                )
+
             self.client.upload_fileobj(
                 _CancellableReader(stream, cancelled),
                 self.bucket,
                 self._key(key),
                 ExtraArgs=extra or None,
                 Callback=callback,
-                Config=TransferConfig(
-                    multipart_threshold=self.multipart_chunk,
-                    multipart_chunksize=self.multipart_chunk,
-                    max_concurrency=4,
-                    use_threads=True,
-                ),
+                Config=TransferConfig(**transfer_config),
             )
             result = self.client.head_object(
                 Bucket=self.bucket, Key=self._key(key)
@@ -628,6 +675,12 @@ class S3BlobStore(BlobStore):
     def acquire_lease(
         self, key: str, owner: str, ttl_seconds: int
     ) -> RemoteLease | None:
+        if self._aliyun_lease is not None:
+            return self._aliyun_lease.acquire_lease(
+                key,
+                owner,
+                ttl_seconds,
+            )
         now = _now()
         token = secrets.token_urlsafe(24)
         expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat()
@@ -659,6 +712,8 @@ class S3BlobStore(BlobStore):
     def renew_lease(
         self, lease: RemoteLease, ttl_seconds: int
     ) -> RemoteLease | None:
+        if self._aliyun_lease is not None:
+            return self._aliyun_lease.renew_lease(lease, ttl_seconds)
         current = self._read_lease(lease.key)
         if not current:
             return None
@@ -677,6 +732,9 @@ class S3BlobStore(BlobStore):
         )
 
     def release_lease(self, lease: RemoteLease) -> None:
+        if self._aliyun_lease is not None:
+            self._aliyun_lease.release_lease(lease)
+            return
         current = self._read_lease(lease.key)
         if not current:
             return
@@ -686,6 +744,94 @@ class S3BlobStore(BlobStore):
         value["expires_at"] = _now().isoformat()
         value["released"] = True
         self._conditional_put(lease.key, value, etag=version)
+
+    def _lease_probe_error(self, summary: str) -> StorageError:
+        return StorageError(
+            f"验证远端租约失败：{summary}",
+            details={
+                "diagnostic": {
+                    "kind": "lease_capability",
+                    "title": "对象存储不满足安全租约要求",
+                    "summary": summary,
+                    "suggestions": [
+                        "确认目标支持原子创建、比较交换以及可续期租约后重试。",
+                        "不要通过关闭远端锁绕过该检查。",
+                    ],
+                    "operation": "验证远端租约",
+                    "provider": self.provider,
+                    "endpoint": self.config.endpoint_url or "AWS 默认 Endpoint",
+                    "bucket": self.bucket,
+                    "region": self.config.region,
+                }
+            },
+        )
+
+    def _cleanup_lease_probe(self, key: str) -> None:
+        if self._aliyun_lease is not None:
+            self._aliyun_lease.cleanup_lease_log(key)
+        else:
+            self.delete(key)
+
+    def validate_capabilities(self) -> dict[str, object]:
+        """Exercise the exact lease transitions required by backup engines."""
+
+        marker = secrets.token_hex(16)
+        lease_key = f"v1/system/probes/{marker}.lease.json"
+        active: RemoteLease | None = None
+        try:
+            active = self.acquire_lease(
+                lease_key,
+                "configuration-probe",
+                60,
+            )
+            if active is None:
+                raise self._lease_probe_error(
+                    "无法原子获取唯一的远端租约探针。"
+                )
+            renewed = self.renew_lease(active, 60)
+            if renewed is None:
+                raise self._lease_probe_error(
+                    "远端租约探针无法通过比较交换完成续期。"
+                )
+            active = renewed
+            self.release_lease(active)
+            active = None
+
+            replacement = self.acquire_lease(
+                lease_key,
+                "configuration-probe-reacquire",
+                60,
+            )
+            if replacement is None:
+                raise self._lease_probe_error(
+                    "已释放的远端租约无法被安全地重新获取。"
+                )
+            active = replacement
+            self.release_lease(active)
+            active = None
+        except Exception:
+            if active is not None:
+                try:
+                    self.release_lease(active)
+                except Exception:
+                    pass
+            try:
+                self._cleanup_lease_probe(lease_key)
+            except Exception:
+                pass
+            raise
+
+        self._cleanup_lease_probe(lease_key)
+        return {
+            "atomic_acquire": True,
+            "compare_and_swap": True,
+            "renewable_lease": True,
+            "lease_protocol": (
+                self._aliyun_lease.protocol_name
+                if self._aliyun_lease is not None
+                else "s3_conditional_put"
+            ),
+        }
 
     def abort_stale_multipart_uploads(self, older_than_days: int = 7) -> int:
         cutoff = _now() - timedelta(days=older_than_days)

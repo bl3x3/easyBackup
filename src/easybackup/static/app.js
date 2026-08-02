@@ -1278,7 +1278,21 @@ function renderTaskCard(task) {
         : `≥ ${task.delta_threshold_mb ?? 100} MB / 最高 ${Math.round(numberOr(task.delta_max_ratio, 0.9) * 100)}%`,
     ),
   );
+  const bandwidth = element("div", "task-meta");
+  const uploadLimit = numberOr(task.storage?.upload_limit_mbps, 0);
+  append(
+    bandwidth,
+    element("span", "", "上传限速"),
+    element(
+      "strong",
+      "",
+      task.storage?.kind === "s3" && uploadLimit > 0
+        ? `${uploadLimit} Mbps`
+        : "不限速",
+    ),
+  );
   append(meta, target, schedule, strategy, retention, delta);
+  if (task.storage?.kind === "s3") meta.append(bandwidth);
 
   const foot = element("div", "task-card-foot");
   const left = element("div");
@@ -1449,6 +1463,7 @@ function resetTaskForm() {
   $("#s3Prefix").value = "easybackup";
   $("#s3CredentialProfile").value = "default";
   $("#s3ChunkSize").value = "16";
+  $("#s3UploadLimit").value = "0";
   $("#sftpPort").value = "22";
   $("#sftpBasePath").value = "easybackup";
   $("#sftpCredentialProfile").value = "default";
@@ -1523,6 +1538,7 @@ function openTaskForm(taskId = "") {
       $("#s3CredentialProfile").value = task.storage?.credential_profile ?? "default";
       $("#s3StorageClass").value = task.storage?.storage_class ?? "";
       $("#s3ChunkSize").value = task.storage?.multipart_chunk_mb ?? 16;
+      $("#s3UploadLimit").value = task.storage?.upload_limit_mbps ?? 0;
     } else if (kind === "sftp") {
       $("#sftpHost").value = task.storage?.host ?? "";
       $("#sftpPort").value = task.storage?.port ?? 22;
@@ -1631,6 +1647,7 @@ function collectStoragePayload() {
       credential_profile: $("#s3CredentialProfile").value.trim() || "default",
       storage_class: $("#s3StorageClass").value.trim() || null,
       multipart_chunk_mb: numberOr($("#s3ChunkSize").value, 16),
+      upload_limit_mbps: numberOr($("#s3UploadLimit").value, 0),
     };
   }
   if (kind === "sftp") {
@@ -1807,6 +1824,19 @@ function validateTaskPayload(payload) {
     setFieldError(form, "storage.bucket", "请输入 Bucket 名称。");
     valid = false;
   }
+  if (
+    payload.storage.kind === "s3" &&
+    payload.storage.upload_limit_mbps !== 0 &&
+    (payload.storage.upload_limit_mbps < 1 ||
+      payload.storage.upload_limit_mbps > 100000)
+  ) {
+    setFieldError(
+      form,
+      "storage.upload_limit_mbps",
+      "请输入 0（不限速）或 1–100000 Mbps。",
+    );
+    valid = false;
+  }
   if (validateSftpStoragePayload(payload.storage, form).length) {
     valid = false;
   }
@@ -1951,9 +1981,17 @@ async function runTask(event) {
 
 function operationStatsText(operation) {
   const stats = operation.stats ?? {};
-  const done = stats.bytes_done ?? stats.uploaded_bytes ?? stats.processed_bytes;
+  const done =
+    stats.bytes_done ??
+    stats.uploaded_bytes ??
+    stats.processed_bytes ??
+    stats.bytes_hashed;
   const total = stats.bytes_total ?? stats.total_bytes;
-  const filesDone = stats.files_done ?? stats.processed_files ?? stats.file_count;
+  const filesDone =
+    stats.files_done ??
+    stats.processed_files ??
+    stats.file_count ??
+    stats.files_scanned;
   const speed = stats.speed_bps;
   const parts = [];
   if (done !== undefined) parts.push(total ? `${formatBytes(done)} / ${formatBytes(total)}` : formatBytes(done));

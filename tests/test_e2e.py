@@ -10,11 +10,13 @@ from easybackup.manifest import load_manifest
 from easybackup.models import (
     LocalStorageConfig,
     RestoreRequest,
+    S3StorageConfig,
     SnapshotKind,
     TaskCreate,
     TaskUpdate,
 )
 from easybackup.storage import create_store
+from easybackup.storage.local import LocalBlobStore
 
 
 def test_full_incremental_selective_restore_and_scrub(
@@ -236,6 +238,53 @@ def test_source_root_switch_forces_full_and_reads_new_content(
         ),
     )
     assert (restored / "same.txt").read_text(encoding="utf-8") == "new!"
+
+
+def test_changing_s3_upload_limit_keeps_incremental_chain(
+    database, credentials, tmp_path, monkeypatch
+):
+    source = tmp_path / "limited-source"
+    source.mkdir()
+    value = source / "value.txt"
+    value.write_text("before", encoding="utf-8")
+    repository = LocalBlobStore(tmp_path / "limited-repository")
+    monkeypatch.setattr(
+        "easybackup.engine.backup.create_store",
+        lambda _storage, _credentials: repository,
+    )
+    task = database.create_task(
+        TaskCreate(
+            name="s3-limit-chain",
+            source_path=str(source),
+            storage=S3StorageConfig(
+                bucket="example-bucket",
+                region="us-east-1",
+                endpoint_url="https://s3.example.invalid",
+            ),
+            compression="gzip",
+            shard_size_mb=8,
+            full_every=100,
+        )
+    )
+    engine = BackupEngine(database, credentials, tmp_path / "limit-locks", 1024)
+    first = engine.run(task)
+
+    task = database.update_task(
+        task.id,
+        TaskUpdate(
+            storage=task.storage.model_copy(
+                update={"upload_limit_mbps": 25}
+            )
+        ),
+    )
+    value.write_text("after!", encoding="utf-8")
+    os.utime(value, None)
+    second = engine.run(task)
+
+    assert first.kind == SnapshotKind.FULL
+    assert second.kind == SnapshotKind.INCREMENTAL
+    assert second.chain_id == first.chain_id
+    assert second.parent_snapshot_id == first.id
 
 
 def test_force_full_does_not_depend_on_previous_manifest(

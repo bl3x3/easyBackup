@@ -112,11 +112,31 @@ class S3StorageConfig(StrictModel):
     credential_profile: str = "default"
     storage_class: str | None = None
     multipart_chunk_mb: int = Field(default=16, ge=5, le=512)
+    # Decimal megabits per second, matching how network links are marketed.
+    # Zero disables throttling.
+    upload_limit_mbps: float = Field(default=0, ge=0, le=100_000)
 
     @field_validator("endpoint_url", mode="before")
     @classmethod
     def normalize_endpoint_url(cls, value: object) -> str | None:
         return normalize_s3_endpoint_url(value)
+
+    @field_validator("upload_limit_mbps")
+    @classmethod
+    def validate_upload_limit(cls, value: float) -> float:
+        if 0 < value < 1:
+            raise ValueError("上传限速必须为 0（不限速）或至少 1 Mbps。")
+        return value
+
+    @model_validator(mode="after")
+    def require_aliyun_region(self) -> "S3StorageConfig":
+        if is_aliyun_oss_endpoint(self.endpoint_url) and not (
+            self.region or ""
+        ).strip():
+            raise ValueError(
+                "阿里云 OSS 必须填写 Bucket 所在 Region，例如 cn-shanghai。"
+            )
+        return self
 
 
 class SFTPStorageConfig(StrictModel):
@@ -209,6 +229,15 @@ StorageConfig = Annotated[
     LocalStorageConfig | S3StorageConfig | SFTPStorageConfig,
     Field(discriminator="kind"),
 ]
+
+
+def storage_location_identity(storage: StorageConfig) -> dict[str, Any]:
+    """Return fields that identify where objects live, not transfer tuning."""
+
+    value = storage.model_dump(mode="json")
+    if isinstance(storage, S3StorageConfig):
+        value.pop("upload_limit_mbps", None)
+    return value
 
 
 DEFAULT_EXCLUDES = [

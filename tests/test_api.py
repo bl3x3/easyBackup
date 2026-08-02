@@ -8,7 +8,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from easybackup.app import create_app
 from easybackup.config import Settings
-from easybackup.models import SFTPStorageConfig
+from easybackup.models import S3StorageConfig, SFTPStorageConfig
 from easybackup.storage.base import ObjectStat
 
 
@@ -30,6 +30,7 @@ def test_api_task_backup_flow(tmp_path):
         root = client.get("/")
         assert root.headers["x-frame-options"] == "DENY"
         assert 'id="storageDiagnosticPanel"' in root.text
+        assert 'id="s3UploadLimit"' in root.text
         assert "s3.oss-cn-shanghai.aliyuncs.com" in root.text
         assert "frame-ancestors 'none'" in root.headers[
             "content-security-policy"
@@ -112,6 +113,66 @@ def test_api_task_backup_flow(tmp_path):
         assert manifest.json()["files"][0]["path"] == "hello.txt"
 
 
+def test_s3_upload_limit_round_trips_through_task_api(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        open_browser=False,
+        credential_backend="encrypted_file",
+    )
+    with TestClient(
+        create_app(settings), base_url="http://127.0.0.1"
+    ) as client:
+        created = client.post(
+            "/api/v1/tasks",
+            json={
+                "name": "limited-s3",
+                "source_path": str(source),
+                "storage": {
+                    "kind": "s3",
+                    "bucket": "example-bucket",
+                    "region": "us-east-1",
+                    "credential_profile": "default",
+                    "upload_limit_mbps": 12.5,
+                },
+            },
+        )
+
+        assert created.status_code == 201, created.text
+        task = created.json()
+        assert task["storage"]["upload_limit_mbps"] == 12.5
+        fetched = client.get(f"/api/v1/tasks/{task['id']}")
+        assert fetched.status_code == 200
+        assert fetched.json()["storage"]["upload_limit_mbps"] == 12.5
+        listed = client.get("/api/v1/tasks")
+        assert listed.status_code == 200
+        assert listed.json()[0]["storage"]["upload_limit_mbps"] == 12.5
+
+        updated = client.put(
+            f"/api/v1/tasks/{task['id']}",
+            json={
+                "storage": {
+                    **task["storage"],
+                    "upload_limit_mbps": 25,
+                }
+            },
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["storage"]["upload_limit_mbps"] == 25
+
+        invalid = client.put(
+            f"/api/v1/tasks/{task['id']}",
+            json={
+                "storage": {
+                    **task["storage"],
+                    "upload_limit_mbps": 0.5,
+                }
+            },
+        )
+        assert invalid.status_code == 422
+
+
 def test_storage_configuration_probe_is_verified_and_removed(tmp_path):
     repository = tmp_path / "probe-repository"
     settings = Settings(
@@ -191,6 +252,116 @@ def test_s3_configuration_probe_reports_actionable_common_errors(tmp_path):
             or issue["path"] == "storage.endpoint_url"
             for issue in field_errors
         )
+
+
+def test_s3_configuration_probe_reports_capabilities_and_connection(
+    tmp_path,
+    monkeypatch,
+):
+    class ProbeStore:
+        provider = "aliyun_oss"
+        addressing_style = "virtual"
+        signature_version = "s3"
+
+        def __init__(self):
+            self.payloads: dict[str, bytes] = {}
+            self.calls: list[str] = []
+
+        def validate_capabilities(self):
+            self.calls.append("validate_capabilities")
+            return {
+                "atomic_acquire": True,
+                "compare_and_swap": True,
+                "renewable_lease": True,
+                "lease_protocol": "oss_append_position",
+            }
+
+        def put_bytes(self, key, payload, *, metadata=None):
+            self.calls.append("put")
+            assert metadata == {
+                "easybackup-artifact": "configuration-probe"
+            }
+            self.payloads[key] = bytes(payload)
+            return ObjectStat(key=key, size=len(payload))
+
+        def stat(self, key):
+            self.calls.append("stat")
+            payload = self.payloads.get(key)
+            return (
+                ObjectStat(key=key, size=len(payload))
+                if payload is not None
+                else None
+            )
+
+        def read_bytes(self, key):
+            self.calls.append("read")
+            return self.payloads[key]
+
+        def delete(self, key):
+            self.calls.append("delete")
+            self.payloads.pop(key, None)
+
+    probe_store = ProbeStore()
+
+    def fake_create_store(config, credentials):
+        del credentials
+        assert isinstance(config, S3StorageConfig)
+        assert config.endpoint_url == (
+            "https://s3.oss-cn-shanghai.aliyuncs.com"
+        )
+        assert config.region == "cn-shanghai"
+        assert config.credential_profile == "aliyun-probe"
+        return probe_store
+
+    monkeypatch.setattr("easybackup.app.create_store", fake_create_store)
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        open_browser=False,
+        credential_backend="encrypted_file",
+    )
+    with TestClient(
+        create_app(settings),
+        base_url="http://127.0.0.1",
+    ) as client:
+        response = client.post(
+            "/api/v1/storage/test",
+            json={
+                "storage": {
+                    "kind": "s3",
+                    "bucket": "backup-dinnerparty",
+                    "prefix": "easybackup",
+                    "endpoint_url": "oss-cn-shanghai.aliyuncs.com",
+                    "region": "cn-shanghai",
+                    "credential_profile": "aliyun-probe",
+                }
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["kind"] == "s3"
+    assert result["target"] == "s3://backup-dinnerparty/easybackup"
+    assert result["connection"] == {
+        "provider": "aliyun_oss",
+        "endpoint": "https://s3.oss-cn-shanghai.aliyuncs.com",
+        "region": "cn-shanghai",
+        "addressing_style": "virtual",
+        "signature_version": "s3",
+        "capabilities": {
+            "atomic_acquire": True,
+            "compare_and_swap": True,
+            "renewable_lease": True,
+            "lease_protocol": "oss_append_position",
+        },
+    }
+    assert probe_store.calls == [
+        "validate_capabilities",
+        "put",
+        "stat",
+        "read",
+        "delete",
+    ]
+    assert probe_store.payloads == {}
 
 
 def test_sftp_task_json_round_trip_and_credential_delete_is_protected(

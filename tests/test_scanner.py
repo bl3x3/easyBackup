@@ -4,6 +4,7 @@ import os
 
 import pytest
 
+import easybackup.scanner as scanner_module
 from easybackup.scanner import scan_source
 
 
@@ -53,3 +54,33 @@ def test_follow_symlinks_never_reads_files_outside_source(tmp_path):
 
     assert result.files == []
     assert any("指向源目录之外" in item for item in result.skipped)
+
+
+def test_hash_progress_is_throttled_without_weakening_byte_accounting(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    payload_size = 20 * 1024 * 1024
+    with (source / "large.bin").open("wb") as handle:
+        handle.truncate(payload_size)
+
+    monkeypatch.setattr(
+        scanner_module, "_SCAN_PROGRESS_MIN_INTERVAL_SECONDS", 60.0
+    )
+    monkeypatch.setattr(
+        scanner_module, "_SCAN_PROGRESS_MIN_BYTES", payload_size * 2
+    )
+    monkeypatch.setattr(scanner_module, "_SCAN_PROGRESS_MIN_FILES", 10_000)
+    updates: list[tuple[int, int]] = []
+
+    result = scan_source(
+        source,
+        [],
+        {},
+        force_hash_all=True,
+        progress=lambda files, hashed: updates.append((files, hashed)),
+    )
+
+    assert result.hashed_bytes == payload_size
+    assert updates == [(1, payload_size)]
