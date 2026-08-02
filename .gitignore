@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.ui-dark-data/
 .coverage
 htmlcov/
 .venv/
@@ -15,4 +16,3 @@ easybackup-data/
 *.db-shm
 *.db-wal
 *.part
-
